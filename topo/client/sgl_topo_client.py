@@ -16,15 +16,15 @@ logger = init_logger(__name__)
 def get_sgl_router_endpoint(worker_info: dict) -> Optional[str]:
     rbg_group_name = os.getenv("RBG_GROUP_NAME")
     if rbg_group_name is None:
-        raise Exception("RBG_GROUP_NAME is not set")
+        raise RuntimeError("RBG_GROUP_NAME is not set")
 
     router_role_name = os.getenv("SGL_ROUTER_ROLE_NAME")
     if router_role_name is None:
-        raise Exception("SGL_ROUTER_ROLE_NAME is not set")
+        raise RuntimeError("SGL_ROUTER_ROLE_NAME is not set")
 
     sgl_router_port = os.getenv("SGL_ROUTER_PORT")
     if sgl_router_port is None:
-        raise Exception("SGL_ROUTER_PORT is not set")
+        raise RuntimeError("SGL_ROUTER_PORT is not set")
 
     return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{sgl_router_port}"
 
@@ -38,15 +38,15 @@ def get_worker_endpoint(worker_info: dict) -> Optional[str]:
     # Use headless service pod domain if POD_IP is not set
     rbg_group_name = os.getenv("RBG_GROUP_NAME")
     if rbg_group_name is None:
-        raise Exception("RBG_GROUP_NAME is not set")
+        raise RuntimeError("RBG_GROUP_NAME is not set")
 
     role_name = os.getenv("RBG_ROLE_NAME")
     if role_name is None:
-        raise Exception("RBG_ROLE_NAME is not set")
+        raise RuntimeError("RBG_ROLE_NAME is not set")
 
     role_index = os.getenv("RBG_ROLE_INDEX")
     if role_index is None:
-        raise Exception("RBG_ROLE_INDEX is not set")
+        raise RuntimeError("RBG_ROLE_INDEX is not set")
 
     return f"{rbg_group_name}-{role_name}-{role_index}.s-{rbg_group_name}-{role_name}:{port}"
 
@@ -85,7 +85,7 @@ class SGLangGroupTopoClient(GroupTopoClient):
             if resp.status_code == 200:
                 logger.info("Health check OK, inference engine is now ready.")
             else:
-                raise Exception(
+                raise RuntimeError(
                     f"health check failed, url: {health_check_url}, status_code: {resp.status_code}, content: {resp.text}")
 
         try:
@@ -118,13 +118,13 @@ class SGLangGroupTopoClient(GroupTopoClient):
                 # Status Code 202 Accepted
                 self.worker_id = resp.json().get("worker_id")
                 if self.worker_id is None:
-                    raise Exception(
+                    raise RuntimeError(
                         f"register failed: missing worker_id in response body, "
                         f"url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}"
                     )
                 logger.info(f"registered worker successfully. worker_id: {self.worker_id}")
             else:
-                raise Exception(f"register failed, url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}")
+                raise RuntimeError(f"register failed, url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}")
 
         try:
             utils.retry(f, retry_times=60, interval=3)
@@ -147,7 +147,7 @@ class SGLangGroupTopoClient(GroupTopoClient):
                 # Status Code 202 Accepted
                 logger.info(f"unregistered worker successfully. worker_id: {self.worker_id}")
             else:
-                raise Exception(
+                raise RuntimeError(
                     f"unregister failed, url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}")
 
         try:
