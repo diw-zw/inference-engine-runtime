@@ -29,11 +29,14 @@ VLLM_METRIC_STANDARD_RULES: Dict[str, StandardRule] = {
     "vllm:time_to_first_token_seconds": RenameStandardRule(
         "vllm:time_to_first_token_seconds", TTFT,
     ),
-    "vllm:time_per_output_token_seconds": RenameStandardRule(
-        "vllm:time_per_output_token_seconds", TPOT,
+    "vllm:request_time_per_output_token_seconds": RenameStandardRule(
+        "vllm:request_time_per_output_token_seconds", TPOT,
     ),
-    "vllm:gpu_cache_usage_perc": RenameStandardRule(
-        "vllm:gpu_cache_usage_perc", gpu_cache_usage,
+    "vllm:inter_token_latency_seconds": RenameStandardRule(
+        "vllm:inter_token_latency_seconds", ITL,
+    ),
+    "vllm:kv_cache_usage_perc": RenameStandardRule(
+        "vllm:kv_cache_usage_perc", gpu_cache_usage,
     ),
     "vllm:e2e_request_latency_seconds": RenameStandardRule(
         "vllm:e2e_request_latency_seconds", e2e_latency,
