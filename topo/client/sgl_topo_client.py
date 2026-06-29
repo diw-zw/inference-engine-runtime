@@ -12,6 +12,8 @@ from patio.topo import utils
 
 logger = init_logger(__name__)
 
+def get_rbg_endpoint(group_name: str, role_name: str, index: str, port: str) -> Optional[str]:
+    return f"{group_name}-{role_name}-{index}.s-{group_name}-{role_name}:{port}"
 
 def get_sgl_router_endpoint(worker_info: dict) -> Optional[str]:
     rbg_group_name = os.getenv("RBG_GROUP_NAME")
@@ -26,7 +28,7 @@ def get_sgl_router_endpoint(worker_info: dict) -> Optional[str]:
     if sgl_router_port is None:
         raise RuntimeError("SGL_ROUTER_PORT is not set")
 
-    return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{sgl_router_port}"
+    return get_rbg_endpoint(rbg_group_name, router_role_name, 0, int(sgl_router_port))
 
 def get_worker_endpoint(worker_info: dict) -> Optional[str]:
     port = worker_info.get("port", "30000")
@@ -48,7 +50,7 @@ def get_worker_endpoint(worker_info: dict) -> Optional[str]:
     if role_index is None:
         raise RuntimeError("RBG_ROLE_INDEX is not set")
 
-    return f"{rbg_group_name}-{role_name}-{role_index}.s-{rbg_group_name}-{role_name}:{port}"
+    return get_rbg_endpoint(rbg_group_name, role_name, role_index, port)
 
 def get_health_check_endpoint(worker_info: dict) -> Optional[str]:
     port = worker_info.get("port", "30000")
