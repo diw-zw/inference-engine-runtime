@@ -1,0 +1,85 @@
+# -*- coding: utf-8 -*-
+"""
+Tests for the vLLM proxy topology client.
+"""
+from unittest.mock import MagicMock, patch
+
+from patio.topo.client.vllm_topo_client import (
+    VLLMProxyTopoClient,
+    get_vllm_proxy_endpoint,
+    get_worker_instance,
+)
+
+
+def test_get_vllm_proxy_endpoint_uses_generic_router_env(monkeypatch):
+    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
+    monkeypatch.setenv("ROUTER_PORT", "9000")
+
+    endpoint = get_vllm_proxy_endpoint({})
+
+    assert endpoint == "demo-proxy-0.s-demo-proxy:9000"
+
+
+def test_get_worker_instance_prefers_explicit_instance(monkeypatch):
+    monkeypatch.setenv("POD_IP", "10.0.0.8")
+
+    instance = get_worker_instance({"instance": "localhost:8102", "port": 8102})
+
+    assert instance == "localhost:8102"
+
+
+def test_get_worker_instance_uses_pod_ip_and_port(monkeypatch):
+    monkeypatch.setenv("POD_IP", "10.0.0.8")
+
+    instance = get_worker_instance({"port": 8102})
+
+    assert instance == "10.0.0.8:8102"
+
+
+@patch("patio.topo.client.vllm_topo_client.requests.post")
+def test_register_posts_instances_add_payload(mock_post, monkeypatch):
+    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
+    monkeypatch.setenv("ROUTER_PORT", "9000")
+
+    response = MagicMock()
+    response.status_code = 200
+    response.text = "ok"
+    mock_post.return_value = response
+
+    client = VLLMProxyTopoClient({"type": "prefill", "instance": "localhost:8102"})
+
+    assert client.register("", {"type": "prefill", "instance": "localhost:8102"})
+    mock_post.assert_called_once_with(
+        "http://demo-proxy-0.s-demo-proxy:9000/instances/add",
+        json={"type": "prefill", "instance": "localhost:8102"},
+        headers={"Content-Type": "application/json"},
+    )
+
+
+@patch("patio.topo.client.vllm_topo_client.requests.post")
+def test_register_returns_false_for_proxy_error(mock_post, monkeypatch):
+    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
+    monkeypatch.setenv("ROUTER_PORT", "9000")
+
+    response = MagicMock()
+    response.status_code = 500
+    response.text = "failed"
+    mock_post.return_value = response
+
+    client = VLLMProxyTopoClient({"type": "prefill", "instance": "localhost:8102"})
+
+    with patch("patio.topo.client.vllm_topo_client.utils.retry", side_effect=lambda func, **_: func()):
+        assert client.register("", {"type": "prefill", "instance": "localhost:8102"}) is False
+
+
+def test_unregister_is_noop(monkeypatch):
+    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
+    monkeypatch.setenv("ROUTER_PORT", "9000")
+
+    client = VLLMProxyTopoClient({"type": "prefill", "instance": "localhost:8102"})
+
+    assert client.unregister() is True

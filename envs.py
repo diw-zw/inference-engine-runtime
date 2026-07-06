@@ -23,6 +23,8 @@ METRIC_SCRAPE_PATH = os.getenv("METRIC_SCRAPE_PATH", "/metrics")
 # Topo
 TOPO_TYPE = os.getenv("TOPO_TYPE")
 TOPO_CONFIG_FILE = os.getenv("TOPO_CONFIG_FILE", "/etc/patio/instance-config.yaml")
+ROUTER_ROLE_NAME = os.getenv("ROUTER_ROLE_NAME")
+ROUTER_PORT = os.getenv("ROUTER_PORT")
 SCHEDULER_ROLE_NAME = os.getenv("SCHEDULER_ROLE_NAME")
 _topo_register_endpoint = os.getenv("TOPO_REGISTER_ENDPOINT")
 

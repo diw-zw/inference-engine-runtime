@@ -18,15 +18,15 @@ def get_sgl_router_endpoint(worker_info: dict) -> Optional[str]:
     if rbg_group_name is None:
         raise Exception("GROUP_NAME is not set")
 
-    router_role_name = os.getenv("SGL_ROUTER_ROLE_NAME")
+    router_role_name = os.getenv("ROUTER_ROLE_NAME")
     if router_role_name is None:
-        raise Exception("SGL_ROUTER_ROLE_NAME is not set")
+        raise Exception("ROUTER_ROLE_NAME is not set")
 
-    sgl_router_port = os.getenv("SGL_ROUTER_PORT")
-    if sgl_router_port is None:
-        raise Exception("SGL_ROUTER_PORT is not set")
+    router_port = os.getenv("ROUTER_PORT")
+    if router_port is None:
+        raise Exception("ROUTER_PORT is not set")
 
-    return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{sgl_router_port}"
+    return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{router_port}"
 
 def get_worker_endpoint(worker_info: dict) -> Optional[str]:
     port = worker_info.get("port", "8000")
