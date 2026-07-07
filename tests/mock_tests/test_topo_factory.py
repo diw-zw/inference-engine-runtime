@@ -2,8 +2,11 @@
 """
 Tests for the topology factory.
 """
+from importlib import reload
+
 import pytest
 
+from patio import envs
 from patio.topo.factory import create_topo_client, create_topo_server
 from patio.topo.client.sgl_topo_client import SGLangGroupTopoClient
 from patio.topo.client.vllm_topo_client import VLLMProxyTopoClient
@@ -16,6 +19,7 @@ def test_create_topo_client_sglang(monkeypatch):
     monkeypatch.setenv("ROUTER_ROLE_NAME", "router")
     monkeypatch.setenv("ROUTER_PORT", "8000")
     monkeypatch.setenv("POD_IP", "10.0.0.8")
+    reload(envs)
     SGLangGroupTopoClient._instance = None
 
     client = create_topo_client("sglang", {"port": 8000})
@@ -27,6 +31,7 @@ def test_create_topo_client_vllm(monkeypatch):
     monkeypatch.setenv("GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    reload(envs)
 
     client = create_topo_client("vllm", {"type": "prefill", "instance": "localhost:8102"})
     assert isinstance(client, VLLMProxyTopoClient)

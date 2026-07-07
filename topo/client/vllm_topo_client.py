@@ -6,6 +6,7 @@ from typing import Optional
 
 import requests
 
+from patio import envs
 from patio.logger import init_logger
 from patio.topo import utils
 from patio.topo.client.base_topo_client import GroupTopoClient
@@ -18,11 +19,11 @@ def get_vllm_proxy_endpoint(worker_info: dict) -> Optional[str]:
     if rbg_group_name is None:
         raise Exception("GROUP_NAME is not set")
 
-    router_role_name = os.getenv("ROUTER_ROLE_NAME")
+    router_role_name = envs.ROUTER_ROLE_NAME
     if router_role_name is None:
         raise Exception("ROUTER_ROLE_NAME is not set")
 
-    router_port = os.getenv("ROUTER_PORT")
+    router_port = envs.ROUTER_PORT
     if router_port is None:
         raise Exception("ROUTER_PORT is not set")
 

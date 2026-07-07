@@ -2,8 +2,10 @@
 """
 Tests for the vLLM proxy topology client.
 """
+from importlib import reload
 from unittest.mock import MagicMock, patch
 
+from patio import envs
 from patio.topo.client.vllm_topo_client import (
     VLLMProxyTopoClient,
     get_vllm_proxy_endpoint,
@@ -15,6 +17,33 @@ def test_get_vllm_proxy_endpoint_uses_generic_router_env(monkeypatch):
     monkeypatch.setenv("GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    reload(envs)
+
+    endpoint = get_vllm_proxy_endpoint({})
+
+    assert endpoint == "demo-proxy-0.s-demo-proxy:9000"
+
+
+def test_get_vllm_proxy_endpoint_uses_legacy_sgl_router_env(monkeypatch):
+    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.delenv("ROUTER_ROLE_NAME", raising=False)
+    monkeypatch.delenv("ROUTER_PORT", raising=False)
+    monkeypatch.setenv("SGL_ROUTER_ROLE_NAME", "legacy-proxy")
+    monkeypatch.setenv("SGL_ROUTER_PORT", "9001")
+    reload(envs)
+
+    endpoint = get_vllm_proxy_endpoint({})
+
+    assert endpoint == "demo-legacy-proxy-0.s-demo-legacy-proxy:9001"
+
+
+def test_get_vllm_proxy_endpoint_prefers_generic_router_env(monkeypatch):
+    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
+    monkeypatch.setenv("ROUTER_PORT", "9000")
+    monkeypatch.setenv("SGL_ROUTER_ROLE_NAME", "legacy-proxy")
+    monkeypatch.setenv("SGL_ROUTER_PORT", "9001")
+    reload(envs)
 
     endpoint = get_vllm_proxy_endpoint({})
 
@@ -42,6 +71,7 @@ def test_register_posts_instances_add_payload(mock_post, monkeypatch):
     monkeypatch.setenv("GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    reload(envs)
 
     response = MagicMock()
     response.status_code = 200
@@ -63,6 +93,7 @@ def test_register_returns_false_for_proxy_error(mock_post, monkeypatch):
     monkeypatch.setenv("GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    reload(envs)
 
     response = MagicMock()
     response.status_code = 500
@@ -79,6 +110,7 @@ def test_unregister_is_noop(monkeypatch):
     monkeypatch.setenv("GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    reload(envs)
 
     client = VLLMProxyTopoClient({"type": "prefill", "instance": "localhost:8102"})
 
