@@ -15,7 +15,7 @@ from patio.topo.server.sgl_topo_server import SGLangGroupTopoServer
 
 def test_create_topo_client_sglang(monkeypatch):
     """Test that create_topo_client returns SGLang client for sglang type."""
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "router")
     monkeypatch.setenv("ROUTER_PORT", "8000")
     monkeypatch.setenv("POD_IP", "10.0.0.8")
@@ -28,7 +28,7 @@ def test_create_topo_client_sglang(monkeypatch):
 
 def test_create_topo_client_vllm(monkeypatch):
     """Test that create_topo_client returns vLLM proxy client for vllm type."""
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     reload(envs)

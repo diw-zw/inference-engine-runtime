@@ -15,17 +15,17 @@ logger = init_logger(__name__)
 
 
 def get_vllm_proxy_endpoint(worker_info: dict) -> Optional[str]:
-    rbg_group_name = os.getenv("GROUP_NAME")
+    rbg_group_name = envs.GROUP_NAME
     if rbg_group_name is None:
-        raise Exception("GROUP_NAME is not set")
+        raise RuntimeError("RBG_GROUP_NAME is not set")
 
     router_role_name = envs.ROUTER_ROLE_NAME
     if router_role_name is None:
-        raise Exception("ROUTER_ROLE_NAME is not set")
+        raise RuntimeError("ROUTER_ROLE_NAME is not set")
 
     router_port = envs.ROUTER_PORT
     if router_port is None:
-        raise Exception("ROUTER_PORT is not set")
+        raise RuntimeError("ROUTER_PORT is not set")
 
     return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{router_port}"
 
@@ -39,17 +39,17 @@ def get_worker_instance(worker_info: dict) -> str:
     if worker_endpoint is not None:
         return f"{worker_endpoint}:{port}"
 
-    rbg_group_name = os.getenv("GROUP_NAME")
+    rbg_group_name = envs.GROUP_NAME
     if rbg_group_name is None:
-        raise Exception("GROUP_NAME is not set")
+        raise RuntimeError("RBG_GROUP_NAME is not set")
 
-    role_name = os.getenv("ROLE_NAME")
+    role_name = envs.ROLE_NAME
     if role_name is None:
-        raise Exception("ROLE_NAME is not set")
+        raise RuntimeError("RBG_ROLE_NAME is not set")
 
-    role_index = os.getenv("ROLE_INDEX")
+    role_index = envs.ROLE_INDEX
     if role_index is None:
-        raise Exception("ROLE_INDEX is not set")
+        raise RuntimeError("RBG_ROLE_INDEX is not set")
 
     return f"{rbg_group_name}-{role_name}-{role_index}.s-{rbg_group_name}-{role_name}:{port}"
 

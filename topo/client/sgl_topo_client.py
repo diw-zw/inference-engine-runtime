@@ -13,46 +13,48 @@ from patio.topo import utils
 
 logger = init_logger(__name__)
 
+def get_rbg_endpoint(group_name: str, role_name: str, index: str, port: str) -> Optional[str]:
+    return f"{group_name}-{role_name}-{index}.s-{group_name}-{role_name}:{port}"
 
 def get_sgl_router_endpoint(worker_info: dict) -> Optional[str]:
-    rbg_group_name = os.getenv("GROUP_NAME")
+    rbg_group_name = envs.GROUP_NAME
     if rbg_group_name is None:
-        raise Exception("GROUP_NAME is not set")
+        raise RuntimeError("RBG_GROUP_NAME is not set")
 
     router_role_name = envs.ROUTER_ROLE_NAME
     if router_role_name is None:
-        raise Exception("ROUTER_ROLE_NAME is not set")
+        raise RuntimeError("ROUTER_ROLE_NAME is not set")
 
     router_port = envs.ROUTER_PORT
     if router_port is None:
-        raise Exception("ROUTER_PORT is not set")
+        raise RuntimeError("ROUTER_PORT is not set")
 
-    return f"{rbg_group_name}-{router_role_name}-0.s-{rbg_group_name}-{router_role_name}:{router_port}"
+    return get_rbg_endpoint(rbg_group_name, router_role_name, "0", router_port)
 
 def get_worker_endpoint(worker_info: dict) -> Optional[str]:
-    port = worker_info.get("port", "8000")
+    port = worker_info.get("port", "30000")
 
     worker_endpoint = os.getenv("POD_IP")
     if worker_endpoint is not None:
         return f"{worker_endpoint}:{port}"
 
     # Use headless service pod domain if POD_IP is not set
-    rbg_group_name = os.getenv("GROUP_NAME")
+    rbg_group_name = os.getenv("RBG_GROUP_NAME")
     if rbg_group_name is None:
-        raise Exception("GROUP_NAME is not set")
+        raise RuntimeError("RBG_GROUP_NAME is not set")
 
-    role_name = os.getenv("ROLE_NAME")
+    role_name = os.getenv("RBG_ROLE_NAME")
     if role_name is None:
-        raise Exception("ROLE_NAME is not set")
+        raise RuntimeError("RBG_ROLE_NAME is not set")
 
-    role_index = os.getenv("ROLE_INDEX")
+    role_index = os.getenv("RBG_ROLE_INDEX")
     if role_index is None:
-        raise Exception("ROLE_INDEX is not set")
+        raise RuntimeError("RBG_ROLE_INDEX is not set")
 
-    return f"{rbg_group_name}-{role_name}-{role_index}.s-{rbg_group_name}-{role_name}:{port}"
+    return get_rbg_endpoint(rbg_group_name, role_name, role_index, port)
 
 def get_health_check_endpoint(worker_info: dict) -> Optional[str]:
-    port = worker_info.get("port", "8000")
+    port = worker_info.get("port", "30000")
 
     local_url = os.getenv("POD_IP")
     if local_url is None:
@@ -86,7 +88,7 @@ class SGLangGroupTopoClient(GroupTopoClient):
             if resp.status_code == 200:
                 logger.info("Health check OK, inference engine is now ready.")
             else:
-                raise Exception(
+                raise RuntimeError(
                     f"health check failed, url: {health_check_url}, status_code: {resp.status_code}, content: {resp.text}")
 
         try:
@@ -119,13 +121,13 @@ class SGLangGroupTopoClient(GroupTopoClient):
                 # Status Code 202 Accepted
                 self.worker_id = resp.json().get("worker_id")
                 if self.worker_id is None:
-                    raise Exception(
+                    raise RuntimeError(
                         f"register failed: missing worker_id in response body, "
                         f"url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}"
                     )
                 logger.info(f"registered worker successfully. worker_id: {self.worker_id}")
             else:
-                raise Exception(f"register failed, url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}")
+                raise RuntimeError(f"register failed, url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}")
 
         try:
             utils.retry(f, retry_times=60, interval=3)
@@ -148,7 +150,7 @@ class SGLangGroupTopoClient(GroupTopoClient):
                 # Status Code 202 Accepted
                 logger.info(f"unregistered worker successfully. worker_id: {self.worker_id}")
             else:
-                raise Exception(
+                raise RuntimeError(
                     f"unregister failed, url: {worker_registration_url}, status_code: {resp.status_code}, content: {resp.text}")
 
         try:

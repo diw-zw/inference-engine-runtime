@@ -14,7 +14,7 @@ from patio.topo.client.vllm_topo_client import (
 
 
 def test_get_vllm_proxy_endpoint_uses_generic_router_env(monkeypatch):
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     reload(envs)
@@ -25,7 +25,7 @@ def test_get_vllm_proxy_endpoint_uses_generic_router_env(monkeypatch):
 
 
 def test_get_vllm_proxy_endpoint_uses_legacy_sgl_router_env(monkeypatch):
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.delenv("ROUTER_ROLE_NAME", raising=False)
     monkeypatch.delenv("ROUTER_PORT", raising=False)
     monkeypatch.setenv("SGL_ROUTER_ROLE_NAME", "legacy-proxy")
@@ -38,7 +38,7 @@ def test_get_vllm_proxy_endpoint_uses_legacy_sgl_router_env(monkeypatch):
 
 
 def test_get_vllm_proxy_endpoint_prefers_generic_router_env(monkeypatch):
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     monkeypatch.setenv("SGL_ROUTER_ROLE_NAME", "legacy-proxy")
@@ -68,7 +68,7 @@ def test_get_worker_instance_uses_pod_ip_and_port(monkeypatch):
 
 @patch("patio.topo.client.vllm_topo_client.requests.post")
 def test_register_posts_instances_add_payload(mock_post, monkeypatch):
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     reload(envs)
@@ -90,7 +90,7 @@ def test_register_posts_instances_add_payload(mock_post, monkeypatch):
 
 @patch("patio.topo.client.vllm_topo_client.requests.post")
 def test_register_returns_false_for_proxy_error(mock_post, monkeypatch):
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     reload(envs)
@@ -107,7 +107,7 @@ def test_register_returns_false_for_proxy_error(mock_post, monkeypatch):
 
 
 def test_unregister_is_noop(monkeypatch):
-    monkeypatch.setenv("GROUP_NAME", "demo")
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     reload(envs)
