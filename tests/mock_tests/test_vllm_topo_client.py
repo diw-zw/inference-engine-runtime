@@ -66,11 +66,36 @@ def test_get_worker_instance_uses_pod_ip_and_port(monkeypatch):
     assert instance == "10.0.0.8:8102"
 
 
+@patch("patio.topo.client.vllm_topo_client.requests.get")
+def test_wait_engine_ready_uses_health_check_timeout(mock_get, monkeypatch):
+    monkeypatch.setenv("RBG_GROUP_NAME", "demo")
+    monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
+    monkeypatch.setenv("ROUTER_PORT", "9000")
+    monkeypatch.setenv("POD_IP", "10.0.0.8")
+    monkeypatch.setenv("TOPO_CONNECT_TIMEOUT", "4")
+    monkeypatch.setenv("TOPO_HEALTH_CHECK_TIMEOUT", "35")
+    reload(envs)
+
+    response = MagicMock()
+    response.status_code = 200
+    mock_get.return_value = response
+
+    client = VLLMProxyTopoClient({"port": 8102})
+
+    assert client.wait_engine_ready({"port": 8102})
+    mock_get.assert_called_once_with(
+        "http://10.0.0.8:8102/health",
+        timeout=(4.0, 35.0),
+    )
+
+
 @patch("patio.topo.client.vllm_topo_client.requests.post")
 def test_register_posts_instances_add_payload(mock_post, monkeypatch):
     monkeypatch.setenv("RBG_GROUP_NAME", "demo")
     monkeypatch.setenv("ROUTER_ROLE_NAME", "proxy")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    monkeypatch.setenv("TOPO_CONNECT_TIMEOUT", "4")
+    monkeypatch.setenv("TOPO_REGISTER_TIMEOUT", "12")
     reload(envs)
 
     response = MagicMock()
@@ -85,6 +110,7 @@ def test_register_posts_instances_add_payload(mock_post, monkeypatch):
         "http://demo-proxy-0.s-demo-proxy:9000/instances/add",
         json={"type": "prefill", "instance": "localhost:8102"},
         headers={"Content-Type": "application/json"},
+        timeout=(4.0, 12.0),
     )
 
 

@@ -84,7 +84,10 @@ class SGLangGroupTopoClient(GroupTopoClient):
     def wait_engine_ready(self, worker_info: dict) -> bool:
         def f():
             health_check_url = f"http://{self.health_check_endpoint}/health"
-            resp = requests.get(health_check_url)
+            resp = requests.get(
+                health_check_url,
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
+            )
             if resp.status_code == 200:
                 logger.info("Health check OK, inference engine is now ready.")
             else:
@@ -116,7 +119,12 @@ class SGLangGroupTopoClient(GroupTopoClient):
 
         def f():
             worker_registration_url = f"http://{self.sgl_router_endpoint}/workers"
-            resp = requests.post(worker_registration_url, json=worker_info, headers={"Content-Type": "application/json"})
+            resp = requests.post(
+                worker_registration_url,
+                json=worker_info,
+                headers={"Content-Type": "application/json"},
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
+            )
             if resp.status_code == 202:
                 # Status Code 202 Accepted
                 self.worker_id = resp.json().get("worker_id")
@@ -145,7 +153,10 @@ class SGLangGroupTopoClient(GroupTopoClient):
 
         def f():
             worker_registration_url = f"http://{self.sgl_router_endpoint}/workers/{self.worker_id}"
-            resp = requests.delete(worker_registration_url)
+            resp = requests.delete(
+                worker_registration_url,
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
+            )
             if resp.status_code == 202:
                 # Status Code 202 Accepted
                 logger.info(f"unregistered worker successfully. worker_id: {self.worker_id}")

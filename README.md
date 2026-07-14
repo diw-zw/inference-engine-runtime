@@ -137,6 +137,9 @@ python -m patio.app --host 127.0.0.1 --port 9091
 | `TOPO_TYPE` | Topology type (`SGLang`, `vLLM`, or `None`) | `None` |
 | `ROUTER_ROLE_NAME` | RBG role name for the topology router or proxy | `None` |
 | `ROUTER_PORT` | Port for the topology router or proxy | `None` |
+| `TOPO_CONNECT_TIMEOUT` | Connection timeout for topology HTTP requests (seconds) | `3` |
+| `TOPO_HEALTH_CHECK_TIMEOUT` | Read timeout for engine health checks (seconds) | `30` |
+| `TOPO_REGISTER_TIMEOUT` | Read timeout for topology register and unregister requests (seconds) | `10` |
 | `GROUP_NAME` | RBG group name | `None` |
 | `ROLE_NAME` | RBG role name | `None` |
 | `ROLE_INDEX` | RBG role index | `None` |

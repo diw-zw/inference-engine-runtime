@@ -70,7 +70,10 @@ class VLLMProxyTopoClient(GroupTopoClient):
     def wait_engine_ready(self, worker_info: dict) -> bool:
         def f():
             health_check_url = f"http://{self.health_check_endpoint}/health"
-            resp = requests.get(health_check_url)
+            resp = requests.get(
+                health_check_url,
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
+            )
             if resp.status_code == 200:
                 logger.info("Health check OK, inference engine is now ready.")
             else:
@@ -104,6 +107,7 @@ class VLLMProxyTopoClient(GroupTopoClient):
                     instance_add_url,
                     json=payload,
                     headers={"Content-Type": "application/json"},
+                    timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
                 )
                 if 200 <= resp.status_code < 300:
                     logger.info(f"registered vLLM instance successfully. instance: {payload['instance']}")
