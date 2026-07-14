@@ -83,7 +83,7 @@ env:
     value: "8000"
 ```
 
-For vLLM proxy registration, set `TOPO_TYPE` to `vllm` and point
+For vLLM proxy registration, set `TOPO_TYPE` to `vLLM` and point
 `ROUTER_ROLE_NAME` / `ROUTER_PORT` at the proxy service. Patio registers workers
 with the proxy using `/instances/add`.
 
@@ -134,7 +134,7 @@ python -m patio.app --host 127.0.0.1 --port 9091
 | `INFERENCE_ENGINE` | Inference engine type (`sglang` or `vllm`) | `sglang` |
 | `INFERENCE_ENGINE_VERSION` | Engine version | `v0.5.3` |
 | `INFERENCE_ENGINE_ENDPOINT` | Engine endpoint URL | `http://localhost:8000` |
-| `TOPO_TYPE` | Topology type (`SGLang`, `vllm`, or `None`) | `None` |
+| `TOPO_TYPE` | Topology type (`SGLang`, `vLLM`, or `None`) | `None` |
 | `ROUTER_ROLE_NAME` | RBG role name for the topology router or proxy | `None` |
 | `ROUTER_PORT` | Port for the topology router or proxy | `None` |
 | `GROUP_NAME` | RBG group name | `None` |
