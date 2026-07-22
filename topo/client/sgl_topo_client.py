@@ -6,6 +6,7 @@ import traceback
 import requests
 from typing import Optional
 
+from patio import envs
 from patio.logger import init_logger
 from patio.topo.client.base_topo_client import GroupTopoClient
 from patio.topo import utils
@@ -16,19 +17,19 @@ def get_rbg_endpoint(group_name: str, role_name: str, index: str, port: str) -> 
     return f"{group_name}-{role_name}-{index}.s-{group_name}-{role_name}:{port}"
 
 def get_sgl_router_endpoint(worker_info: dict) -> Optional[str]:
-    rbg_group_name = os.getenv("RBG_GROUP_NAME")
+    rbg_group_name = envs.GROUP_NAME
     if rbg_group_name is None:
         raise RuntimeError("RBG_GROUP_NAME is not set")
 
-    router_role_name = os.getenv("SGL_ROUTER_ROLE_NAME")
+    router_role_name = envs.ROUTER_ROLE_NAME
     if router_role_name is None:
-        raise RuntimeError("SGL_ROUTER_ROLE_NAME is not set")
+        raise RuntimeError("ROUTER_ROLE_NAME is not set")
 
-    sgl_router_port = os.getenv("SGL_ROUTER_PORT")
-    if sgl_router_port is None:
-        raise RuntimeError("SGL_ROUTER_PORT is not set")
+    router_port = envs.ROUTER_PORT
+    if router_port is None:
+        raise RuntimeError("ROUTER_PORT is not set")
 
-    return get_rbg_endpoint(rbg_group_name, router_role_name, 0, int(sgl_router_port))
+    return get_rbg_endpoint(rbg_group_name, router_role_name, "0", router_port)
 
 def get_worker_endpoint(worker_info: dict) -> Optional[str]:
     port = worker_info.get("port", "30000")
@@ -83,7 +84,10 @@ class SGLangGroupTopoClient(GroupTopoClient):
     def wait_engine_ready(self, worker_info: dict) -> bool:
         def f():
             health_check_url = f"http://{self.health_check_endpoint}/health"
-            resp = requests.get(health_check_url)
+            resp = requests.get(
+                health_check_url,
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_HEALTH_CHECK_TIMEOUT),
+            )
             if resp.status_code == 200:
                 logger.info("Health check OK, inference engine is now ready.")
             else:
@@ -115,7 +119,12 @@ class SGLangGroupTopoClient(GroupTopoClient):
 
         def f():
             worker_registration_url = f"http://{self.sgl_router_endpoint}/workers"
-            resp = requests.post(worker_registration_url, json=worker_info, headers={"Content-Type": "application/json"})
+            resp = requests.post(
+                worker_registration_url,
+                json=worker_info,
+                headers={"Content-Type": "application/json"},
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
+            )
             if resp.status_code == 202:
                 # Status Code 202 Accepted
                 self.worker_id = resp.json().get("worker_id")
@@ -144,7 +153,10 @@ class SGLangGroupTopoClient(GroupTopoClient):
 
         def f():
             worker_registration_url = f"http://{self.sgl_router_endpoint}/workers/{self.worker_id}"
-            resp = requests.delete(worker_registration_url)
+            resp = requests.delete(
+                worker_registration_url,
+                timeout=(envs.TOPO_CONNECT_TIMEOUT, envs.TOPO_REGISTER_TIMEOUT),
+            )
             if resp.status_code == 202:
                 # Status Code 202 Accepted
                 logger.info(f"unregistered worker successfully. worker_id: {self.worker_id}")
