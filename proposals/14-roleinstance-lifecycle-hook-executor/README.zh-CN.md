@@ -3,16 +3,16 @@
 | 项目 | 内容 |
 | --- | --- |
 | 状态 | draft |
-| 日期 | 2026-11-04 创建，2026-11-06 更新 |
+| 日期 | 2026-11-04 创建，2026-11-09 更新 |
 | 作者 | inference-engine-runtime 维护者 |
 | 参考 | `rbg/keps/527-roleinstance-lifecycle/README.zh-CN.md` |
-| 范围 | `postReady` 上线，`preUpdate` / `preDelete` 摘流与排空 |
+| 范围 | `postReady` 上线，`preRecover` 路由清理，`preUpdate` / `preDelete` 摘流与排空 |
 
 ## 摘要
 
-本文中的核心术语先说明如下：RoleInstance（RI）是 RBG 的实例级资源；`postReady` / `preUpdate` / `preDelete` 是 RBG 定义在 RI 上的实例级 lifecycle hook；marker 是 controller 写入 RI labels 的 hook 触发标记；`REGISTRY_MODE` 是选择 Patio 注册控制入口的环境变量。
+本文中的核心术语先说明如下：RoleInstance（RI）是 RBG 的实例级资源；`postReady` / `preUpdate` / `preRecover` / `preDelete` 是 RBG 定义在 RI 上的实例级 lifecycle hook；marker 是 controller 写入 RI labels 的 hook 触发标记；`REGISTRY_MODE` 是选择 Patio 注册控制入口的环境变量。
 
-Patio 当前在进程启动后立即向 SGLang router / vLLM proxy 注册 worker，并由周期性 re-register 维持成员关系。该行为与 RBG 的实例级生命周期协作冲突：实例可能在 `postReady` 前接流量，也可能在 `preUpdate` / `preDelete` 摘流后因重启或 SIGTERM 被重新注册。
+Patio 当前在进程启动后立即向 SGLang router / vLLM proxy 注册 worker，并由周期性 re-register 维持成员关系。该行为与 RBG 的实例级生命周期协作冲突：实例可能在 `postReady` 前接流量，RBG 开始 Recovery 时 router / proxy 中仍可能保留指向失败实例的成员，也可能在 `preUpdate` / `preDelete` 摘流后因重启或 SIGTERM 被重新注册。
 
 本 proposal 将注册控制改为可配置的 `REGISTRY_MODE`：
 
@@ -20,7 +20,7 @@ Patio 当前在进程启动后立即向 SGLang router / vLLM proxy 注册 worker
 REGISTRY_MODE=startup | hook | none
 ```
 
-默认保持 `startup` 以兼容现有部署。指定为 `hook` 时，Patio 成为 RBG RoleInstance lifecycle hook 的 registration executor：由 RoleInstance 的 `hook-state` 与 marker 驱动上线、下线和排空，成功后只清除自己的 marker。
+默认保持 `startup` 以兼容现有部署。指定为 `hook` 时，Patio 成为 RBG RoleInstance lifecycle hook 的 registration executor：由 RoleInstance 的 `hook-state` 与 marker 驱动上线、恢复前路由清理、下线和排空，成功后只清除自己的 marker。
 
 ## 动机
 
@@ -40,33 +40,35 @@ Patio 启动
 这适合“启动即上线”的部署，但不适合由 RBG 控制的实例生命周期：
 
 1. `postReady` 前实例可能已经注册并接收流量；
-2. `preUpdate` / `preDelete` 摘流后，进程重启可能重新注册；
-3. SIGTERM 是进程事件，不代表 RBG 生命周期状态；
-4. endpoint 推导、注册协议、heartbeat 和信号处理耦合在 `topo_client` / `app.py` 中。
+2. RBG 开始 Recovery 时，router / proxy 成员可能仍指向失败实例；
+3. `preUpdate` / `preDelete` 摘流后，进程重启可能重新注册；
+4. SIGTERM 是进程事件，不代表 RBG 生命周期状态；
+5. endpoint 推导、注册协议、heartbeat 和信号处理耦合在 `topo_client` / `app.py` 中。
 
 ### 目标
 
 1. 保留现有 startup 注册行为，默认不破坏存量部署；
-2. 支持 RBG marker 驱动的上线与下线；
+2. 支持 RBG marker 驱动的上线、恢复前路由清理与下线；
 3. 下线时先停止 heartbeat，等待最后一次 register 完成，再 unregister；
-4. 建立通用排空语义，框架差异由 adapter 解释；
-5. 明确 RBG、编排系统和 Patio 的权责边界。
+4. 恢复前清理时先停止 heartbeat，并移除或确认 router 成员不存在，不等待 engine 排空；
+5. 为 `preUpdate` / `preDelete` 建立通用排空语义，框架差异由 adapter 解释；
+6. 明确 RBG、编排系统和 Patio 的权责边界。
 
 ### 非目标
 
 1. 不修改 RBG API、RoleInstance spec 或 controller 状态机；
 2. 不实现 executor 选举、Lease 或授权；
 3. 不管理 Pod finalizer 和 Pod 删除时序；
-4. 不处理 `preRecover`；
-5. 不定义多 Pod RoleInstance 的成员发现与动作聚合协议；
-6. 不实现业务自定义排空检查；业务需要额外排空约束时另行 proposal。
+4. 不定义多 Pod RoleInstance 的成员发现与动作聚合协议；
+5. 不实现业务自定义排空检查；业务需要额外排空约束时另行 proposal。
+6. 不把 `preRecover` 实现为 engine 排空 barrier；Recovery 本身可能因 engine 已死而触发。
 
 ### 用户影响
 
 | 用户 | 影响 | 是否需要行动 |
 | --- | --- | --- |
-| Kubernetes / RBG 运维人员 | 可以通过 `REGISTRY_MODE=hook` 让 Patio 参与实例级上线、摘流和排空；前置 hook 失败时会持续阻塞对应操作 | 启用前需部署新版本 Patio、注入 RI 名称和 marker 配置，并授予最小 Kubernetes API 权限 |
-| 应用开发者 | `postReady` 前 Patio 不注册 worker，`preUpdate` / `preDelete` 后不再由重启或 SIGTERM 自动注册；流量恢复依赖 RBG hook 和 router 状态 | 需要确认业务是否有长连接、流式请求或额外排空检查 |
+| Kubernetes / RBG 运维人员 | 可以通过 `REGISTRY_MODE=hook` 让 Patio 参与实例级上线、恢复前路由清理、摘流和排空；前置 hook 失败时会持续阻塞对应操作 | 启用前需部署新版本 Patio、注入 RI 名称和 marker 配置，并授予最小 Kubernetes API 权限 |
+| 应用开发者 | `postReady` 前 Patio 不注册 worker，`preUpdate` / `preRecover` / `preDelete` 后不再由重启或 SIGTERM 自动注册；流量恢复依赖 RBG hook 和 router 状态 | 需要确认业务是否有长连接、流式请求或额外排空检查 |
 | SGLang / vLLM 集成开发者 | 注册协议被拆分为 adapter，并需要提供可确认的 unregister 和排空状态 | 需确认 router / proxy API 与指标语义 |
 | Patio 维护者 | `topo` 职责拆分为 endpoint、registration、runtime、heartbeat 和 lifecycle，新增 Kubernetes watch / patch 逻辑 | 需按新模块边界实现并补充测试 |
 
@@ -87,6 +89,12 @@ Patio 启动
 ```
 
 ```text
+作为一名 Kubernetes 运维人员，
+我希望 Patio 在 RBG Recovery 前移除陈旧 router 成员，且不等待 engine 排空，
+以便 RBG 重建死亡实例时 router 不继续向它转发流量。
+```
+
+```text
 作为一名 SGLang / vLLM 集成开发者，
 我希望注册和排空行为由显式 adapter 表达，
 以便框架差异不会泄漏到 lifecycle 状态机中。
@@ -98,7 +106,7 @@ Patio 启动
 | --- | --- |
 | Patio | 本项目 inference-engine-runtime 的运行时进程，作为推理引擎 sidecar。 |
 | RoleInstance，RI | RBG 中的实例级资源，一个 RI 代表一个推理实例；本 proposal 首版只支持单 Pod / 单 executor。 |
-| `hook-state` | RBG controller 写在 RI label `rbg.workloads.x-k8s.io/role-instance-hook-state` 上的阶段标记，例如 `PreUpdate`、`PreDelete`、`PostReady`。 |
+| `hook-state` | RBG controller 写在 RI label `rbg.workloads.x-k8s.io/role-instance-hook-state` 上的阶段标记，例如 `PreUpdate`、`PreRecover`、`PreDelete`、`PostReady`。 |
 | marker | RI label 中的 `key=value`，用于告诉 executor 需要处理某个 hook；executor 完成后删除自己的 marker。 |
 | hook executor | 观察 marker、执行业务动作并清除 marker 的组件。本 proposal 中由 Patio 承担 registration hook executor。 |
 | registration | worker 加入 / 退出 router 或 proxy 成员列表的协议。 |
@@ -265,9 +273,11 @@ Heartbeat 是周期性调用 register 的自愈机制，不是下线控制器：
 1. `start()` 后周期性 register；
 2. `stop()` 后不再调度新的 register；
 3. start / stop 幂等；
-4. `preUpdate` / `preDelete` 先 stop heartbeat；
+4. `preUpdate`、`preRecover`、`preDelete` 先 stop heartbeat；
 5. 等待最后一次 register 请求完成后再 unregister；
 6. `postReady` 完成注册后 start heartbeat。
+
+`preRecover` 有意不等待 engine 排空：Recovery 可能正是因为 engine 已死而触发，如果要求 idle engine metrics，会把恢复操作变成死等。
 
 heartbeat 存在时，单次 register 失败可以由下一次 heartbeat 重试；registration 原语不需要额外叠加长时间 retry。
 
@@ -291,10 +301,11 @@ lifecycle hook state label 固定为 KEP-527 的规范值：
 rbg.workloads.x-k8s.io/role-instance-hook-state
 ```
 
-Patio 只处理本 proposal 范围内的三个 state：
+Patio 只处理本 proposal 范围内的四个 state：
 
 ```text
 PreUpdate
+PreRecover
 PreDelete
 PostReady
 ```
@@ -309,7 +320,7 @@ PostReady
 2. Patio watch 指定的 RoleInstance；
 3. 只有 `hook-state` 与 marker 同时匹配时才执行动作；
 4. Patio 在执行有副作用的动作前 GET 最新 RI，并再次确认 state 与 marker 仍匹配；
-5. Patio 执行 register / unregister / drain；
+5. Patio 执行该 hook 对应的 register、unregister、路由清理或 drain 动作；
 6. 成功后，Patio 只删除自己的 marker；
 7. RBG controller 根据 marker 是否仍匹配决定是否继续。
 
@@ -378,7 +389,7 @@ REGISTRY_MODE=startup
 | 模式 | 语义 |
 | --- | --- |
 | `startup` | 保持现有行为：启动时等待 engine ready，register，并启动 heartbeat；不处理 lifecycle marker |
-| `hook` | 本实例是被指定的 registration hook executor：启动不注册、不启动 heartbeat，由 marker 驱动 register / unregister / drain，并清除自己的 marker |
+| `hook` | 本实例是被指定的 registration hook executor：启动不注册、不启动 heartbeat，由 marker 驱动 register / unregister / 恢复前路由清理 / drain，并清除自己的 marker |
 | `none` | 不注册、不启动 heartbeat、不处理 lifecycle marker |
 
 `hook` 和 `startup` 互斥，避免摘流期间进程重启后又被启动逻辑重新注册。
@@ -392,6 +403,7 @@ hook executor 由 RBG / 编排系统通过注入 `REGISTRY_MODE=hook` 指定。P
 | `REGISTRY_MODE` | 可选，默认 `startup` | 注册控制模式 |
 | `LIFECYCLE_RI_NAME` | `REGISTRY_MODE=hook` 必填 | 要 watch 的 RoleInstance 名称 |
 | `LIFECYCLE_PRE_UPDATE_MARKER` | `hook` 时至少配置一个 marker | `preUpdate` 触发 marker |
+| `LIFECYCLE_PRE_RECOVER_MARKER` | `hook` 时至少配置一个 marker | `preRecover` 触发 marker |
 | `LIFECYCLE_POST_READY_MARKER` | `hook` 时至少配置一个 marker | `postReady` 触发 marker |
 | `LIFECYCLE_PRE_DELETE_MARKER` | `hook` 时至少配置一个 marker | `preDelete` 触发 marker |
 | `LIFECYCLE_DRAIN_CHECK_INTERVAL` | 可选，默认 `1s` | 排空快照轮询间隔 |
@@ -401,6 +413,7 @@ marker 示例：
 
 ```text
 LIFECYCLE_PRE_UPDATE_MARKER=patio.engine/update-block=true
+LIFECYCLE_PRE_RECOVER_MARKER=patio.engine/recover-block=true
 LIFECYCLE_POST_READY_MARKER=patio.engine/ready-block=true
 LIFECYCLE_PRE_DELETE_MARKER=patio.engine/delete-block=true
 ```
@@ -478,9 +491,11 @@ async def run(role_instance_name, markers, runtime):
         if event.state == "PostReady" and event.matches(markers.post_ready):
             await handle_post_ready(event, runtime, markers.post_ready)
 
-        elif event.state in ("PreUpdate", "PreDelete"):
+        elif event.state in ("PreUpdate", "PreRecover", "PreDelete"):
             if event.state == "PreUpdate" and event.matches(markers.pre_update):
                 await handle_pre_hook(event, runtime, markers.pre_update)
+            elif event.state == "PreRecover" and event.matches(markers.pre_recover):
+                await handle_pre_recover(event, runtime, markers.pre_recover)
             elif event.state == "PreDelete" and event.matches(markers.pre_delete):
                 await handle_pre_hook(event, runtime, markers.pre_delete)
 ```
@@ -566,7 +581,46 @@ preUpdate / preDelete marker
 5. 首版不执行业务自定义排空检查；业务有额外约束时另行扩展；
 6. marker 删除前 state 与 marker 仍匹配。
 
-### 4.5 排空快照
+### 4.5 `preRecover` 路由清理
+
+触发条件：
+
+```text
+hook-state=PreRecover
+preRecover marker 匹配
+```
+
+```python
+async def handle_pre_recover(event, runtime, marker):
+    runtime.begin_recover_cleanup()
+
+    await runtime.heartbeat.stop(wait_inflight=True)
+    await runtime.unregister_or_confirm_absent()
+
+    await marker.clear_if_still_matching(event)
+```
+
+执行顺序：
+
+```text
+preRecover marker
+  -> heartbeat.stop()
+  -> 等待最后一次 register 完成
+  -> unregister 或确认成员不存在
+  -> 清除自己的 marker
+```
+
+`preRecover` 不调用 `wait_until_drained()`。Recovery 本身可能因 engine 已死而触发；`/metrics` 不可达、engine 指标缺失，或 drain snapshot 为 `unknown` / `unsupported`，都不是在 router membership 已移除或确认不存在后继续保留 marker 的理由。
+
+成功条件是：
+
+1. heartbeat 已停止，最后一次 in-flight register 已完成，或已取消且不会调度新的注册；
+2. router / proxy 成员已移除，或确认本来不存在；
+3. marker 删除前，当前 `hook-state` 与 marker 仍匹配。
+
+如果 heartbeat 停止或 router 成员移除结果无法确认，保留 marker，并按有界退避重试幂等动作。Patio 清除 marker 后，RBG 执行实际 Recovery；恢复后的 workload 达到 Ready 时，仍由统一的 `postReady` 路径 register 并启动 heartbeat。
+
+### 4.6 排空快照
 
 runtime 只定义通用排空语义；各推理框架由 adapter 解释“什么是 active / queued / drained”。
 
@@ -631,7 +685,7 @@ vLLM 指标可以覆盖仍在生成的流式请求，但不能覆盖已经生成
 - 注入 `REGISTRY_MODE`、RI 名称和 marker ENV；
 - 管理 RoleInstance lifecycle state 和 marker 写入；
 - 管理 Pod finalizer 和删除时序；
-- 保证 executor 在业务 Pod 删除前可用；
+- 保证需要处理 preRecover / preDelete marker 时 executor 可用；
 - 处理 controller / executor 故障恢复。
 
 ### Patio 负责
@@ -640,13 +694,14 @@ vLLM 指标可以覆盖仍在生成的流式请求，但不能覆盖已经生成
 - 匹配 state 与 marker；
 - 调用 register / unregister；
 - 控制 heartbeat 启停；
-- 执行排空判断；
+- 执行不依赖 engine 排空的 preRecover 路由清理；
+- 执行 preUpdate / preDelete 排空判断；
 - 清除自己的 marker。
 
 ### 当前限制
 
 1. 多 Pod RI 的成员发现与动作调用协议需要 RBG 定义。本 proposal 只定义单 Pod / 单 executor 语义，不做成员发现。
-2. 首版不做业务自定义排空检查。默认 engine 指标不能覆盖空闲 HTTP / SSE / WebSocket 长连接、router / proxy 内部缓冲或外部业务事务；这些约束需要后续独立 proposal 定义扩展接口。
+2. 首版不为 `preUpdate` / `preDelete` 做业务自定义排空检查。默认 engine 指标不能覆盖空闲 HTTP / SSE / WebSocket 长连接、router / proxy 内部缓冲或外部业务事务；这些约束需要后续独立 proposal 定义扩展接口。`preRecover` 有意不使用 engine 排空指标。
 3. 首版不做 RI UID fencing；依赖 RBG preDelete finalizer 和 Patio 动作幂等性处理同名删除重建。
 
 ## 兼容性
@@ -654,7 +709,7 @@ vLLM 指标可以覆盖仍在生成的流式请求，但不能覆盖已经生成
 1. `REGISTRY_MODE` 默认值保持 `startup`，未显式启用 hook 模式的存量部署不改变注册、heartbeat 和信号行为。
 2. `topo` 模块重构是内部结构变化；`TOPO_TYPE`、`--instance-info`、router endpoint 推导和现有注册协议在 `startup` 模式下保持兼容。
 3. hook 模式要求 RBG controller 已实现 KEP-527 的新 Role-level lifecycle 协议、`role-instance-hook-state` label 和 marker 写入。Patio 不兼容只存在旧 RIS `PreparingUpdate` / `PreparingDelete` 状态机的部署。
-4. SGLang router 需要提供 list worker，并以稳定 worker endpoint 识别和删除成员；vLLM proxy 需要提供 `/instances/remove`。部署版本缺少这些能力时，pre hook fail closed，不能通过忽略 unregister 放行。
+4. SGLang router 需要提供 list worker，并以稳定 worker endpoint 识别和删除成员；vLLM proxy 需要提供 `/instances/remove`。部署版本缺少这些能力时，pre hook fail closed，不能通过忽略 unregister 放行。该要求同样适用于 `preRecover` 路由清理，但该 hook 不依赖 engine 指标。
 5. 版本偏差要求：先升级 Patio / router / proxy 能力，再部署 RBG hook 配置和 `REGISTRY_MODE=hook`。RBG 与 Patio 对 state key、state value 和 marker 匹配语义的理解必须一致。
 6. 降级或回滚时，不能直接把仍有匹配 marker 的实例切回 `startup`。操作顺序是先停止新的 RBG 操作，等待或显式处理未完成 hook，确认没有残留 `hook-state` / marker，再移除 hook 配置或回滚 Patio。
 7. 新增指标和日志均为附加行为，不承诺现有指标名不变；移除或重命名旧指标时另行提供迁移说明。
@@ -663,7 +718,7 @@ vLLM 指标可以覆盖仍在生成的流式请求，但不能覆盖已经生成
 
 ## 可观测性
 
-日志必须记录配置解析结果、watch 建立 / 断开 / 重连、hook 触发、register / unregister 结果、drain 快照、marker 清理结果和失败原因。日志不得输出 service account token 或其他敏感配置。
+日志必须记录配置解析结果、watch 建立 / 断开 / 重连、hook 触发、register / unregister 结果、恢复前路由清理、drain 快照、marker 清理结果和失败原因。日志不得输出 service account token 或其他敏感配置。
 
 建议新增指标：
 
@@ -671,8 +726,8 @@ vLLM 指标可以覆盖仍在生成的流式请求，但不能覆盖已经生成
 | --- | --- | --- | --- |
 | `patio_lifecycle_event_total` | Counter | `state`, `matched` | 收到的 RI 事件数，以及 state / marker 是否匹配 |
 | `patio_lifecycle_action_total` | Counter | `hook`, `result` | hook 动作成功、失败、取消次数 |
-| `patio_lifecycle_action_duration_seconds` | Histogram | `hook`, `phase` | register、unregister、drain、clear marker 的耗时 |
-| `patio_registration_state` | Gauge | `engine`, `protocol` | 当前本地 traffic state：未注册、注册中、serving、draining、未注册确认 |
+| `patio_lifecycle_action_duration_seconds` | Histogram | `hook`, `phase` | register、unregister、恢复前路由清理、drain、clear marker 的耗时 |
+| `patio_registration_state` | Gauge | `engine`, `protocol` | 当前本地 traffic state：未注册、注册中、serving、draining、recover-cleanup、未注册确认 |
 | `patio_drain_state` | Gauge | `engine`, `source` | adapter 报告的 idle / draining / unknown / unsupported |
 | `patio_lifecycle_watch_errors_total` | Counter | `operation`, `reason` | watch / patch / get 失败次数 |
 
@@ -682,7 +737,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 排查指引：
 
-1. 前置 marker 长期保留：检查 Patio 是否运行在 `REGISTRY_MODE=hook`、watch 是否正常、action 失败日志、router / proxy 是否可达、drain 是否为 `unknown` / `unsupported`。
+1. 前置 marker 长期保留：检查 Patio 是否运行在 `REGISTRY_MODE=hook`、watch 是否正常、action 失败日志、router / proxy 是否可达。对 `preUpdate` / `preDelete`，还要检查 drain 是否为 `unknown` / `unsupported`；对 `preRecover`，engine 指标不是成功条件。
 2. `postReady` marker 长期保留：检查 engine ready、register 失败和 heartbeat 状态；它不代表 controller 阻塞。
 3. 实例未接流量：检查 Patio 是否未收到 postReady marker、marker 配置是否与 RBG 生效配置一致、router 成员状态和 heartbeat。
 4. controller 未推进：检查是否还有其他 executor 的 marker 未清除，Patio 只清除自己配置的 marker。
@@ -714,6 +769,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 | marker / state 配置与 RBG 生效配置不一致 | marker 不匹配或被错误清理 | matched / action 指标，启动日志 | 编排系统从 `labelsHandler` 注入 ENV；实现启动前做格式校验，集成测试覆盖不一致场景 |
 | watch 事件陈旧或同名 RI 重建 | 基于旧对象执行 unregister / register | resourceVersion 日志、注册状态 | 执行副作用前 GET 最新对象并复核 state / marker；依赖 preDelete finalizer 和动作幂等，首版不做 UID fencing |
 | executor 在 pre hook 中重启 | 动作重复或中断 | action result、进程重启日志 | register / unregister 必须幂等；marker 保留并在重启后重放 |
+| preRecover 时 executor 已不可用 | Recovery marker 无法清除，实际恢复被阻塞 | marker 存留时间、executor 进程日志 | 编排系统保证处理 preRecover marker 时 executor 可用；无法保证的部署不要把 preRecover marker 指给 Patio，或改用独立 executor |
 | engine 指标缺失或解析失败 | 无法确认 idle，前置 hook 长期等待 | drain state 指标 | `unknown` / `unsupported` fail closed；提供日志和指标定位 |
 | 长连接 / 流式请求未计入 active requests | 过早清除 marker，请求被中断 | 业务错误率、drain 耗时分布 | 指标只作为首版默认；业务可扩展自定义检查，长流式场景需显式确认 |
 | 误将 executor 配置为 `startup` | 摘流后重启自动注册 | registry state / heartbeat 日志 | hook 模式必须显式注入；部署文档和配置校验避免静默回退 |
@@ -730,7 +786,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 ### 只保留 startup 注册
 
-优点是改动最小，缺点是无法参与 `postReady` / `preUpdate` / `preDelete` 协作，无法安全摘流和排空。
+优点是改动最小，缺点是无法参与 `postReady` / `preUpdate` / `preRecover` / `preDelete` 协作，无法在恢复前清理陈旧路由，也无法安全摘流和排空。
 
 ### RBG controller 直接调用 Patio HTTP API
 
@@ -750,27 +806,29 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 1. `REGISTRY_MODE` 解析：默认 `startup`，非法值拒绝启动；`hook` 缺少 RI 名称或 marker 拒绝启动。
 2. marker `key=value` 解析：首个 `=` 拆分、空 key、非法 label key / value、重复配置、值为空均拒绝。
-3. RI 事件分发：`PreUpdate`、`PreDelete`、`PostReady` 与 marker 必须同时匹配；仅旧 marker 不触发；未知 state 忽略；事件重复只触发幂等处理。
+3. RI 事件分发：`PreUpdate`、`PreRecover`、`PreDelete`、`PostReady` 与 marker 必须同时匹配；仅旧 marker 不触发；未知 state 忽略；事件重复只触发幂等处理。
 4. traffic state machine：`postReady` register 成功后启动 heartbeat；pre hook 先 stop heartbeat、等待 inflight register、再 unregister；最新 hook-state 抢占旧任务后不清理旧 marker。
-5. heartbeat：start / stop 幂等；stop 后不调度新请求；能等待最后一次 register 完成；心跳异常不改变 drain 状态。
-6. marker 清理：JSON Merge Patch 只删除自己的 key；state 或 marker 已变化时不 PATCH；对象不存在、marker 已删除、PATCH 冲突的处理。
-7. drain adapter：`/metrics` 可访问但必需指标缺失时返回 `unsupported`；网络失败、超时、5xx、NaN、非数字或解析失败返回 `unknown`；两者都不视为 idle，且会重置稳定样本计数。
-8. vLLM drain：running / waiting 为 0 但 swapped 大于 0 时不能报告 idle；三者连续为 0 且达到稳定样本数后报告 idle。
-9. SGLang drain：running / queue 任一大于 0 时不能报告 idle；两者连续为 0 且达到稳定样本数后报告 idle。
-10. signal：三种模式下的 SIGTERM / SIGINT 行为；hook 模式中断后 marker 保留且不 unregister。
+5. `preRecover`：先停止 heartbeat，再 unregister 或确认成员不存在，不调用 engine drain；router 清理确认成功后，`unknown` / `unsupported` engine 指标不导致 marker 继续保留；重试期间 heartbeat 保持停止。
+6. heartbeat：start / stop 幂等；stop 后不调度新请求；能等待最后一次 register 完成；心跳异常不改变 drain 状态。
+7. marker 清理：JSON Merge Patch 只删除自己的 key；state 或 marker 已变化时不 PATCH；对象不存在、marker 已删除、PATCH 冲突的处理。
+8. drain adapter：`/metrics` 可访问但必需指标缺失时返回 `unsupported`；网络失败、超时、5xx、NaN、非数字或解析失败返回 `unknown`；两者都不视为 idle，且会重置稳定样本计数。
+9. vLLM drain：running / waiting 为 0 但 swapped 大于 0 时不能报告 idle；三者连续为 0 且达到稳定样本数后报告 idle。
+10. SGLang drain：running / queue 任一大于 0 时不能报告 idle；两者连续为 0 且达到稳定样本数后报告 idle。
+11. signal：三种模式下的 SIGTERM / SIGINT 行为；hook 模式中断后 marker 保留且不 unregister。
 
 ### 集成测试
 
 1. 使用 fake Kubernetes API server 建立单 RI watch，覆盖 LIST/WATCH 重连、resourceVersion 过期、陈旧事件、marker PATCH 失败和对象删除。
 2. 使用 mocked SGLang router / vLLM proxy 验证 register 幂等、unregister 幂等、remove 失败、进程重启后丢失句柄、router 重启后的 heartbeat 恢复。
-3. 使用 mocked engine metrics 验证 `preUpdate` / `preDelete` 的完整摘流顺序，以及 register / unregister / drain 部分失败时 marker 保留。
-4. 验证 `startup` 模式的现有行为不因模块重构改变，作为兼容性回归。
+3. 使用 mocked SGLang router / vLLM proxy 和不可达的 engine metrics endpoint，验证 `preRecover` 的完整清理顺序，包括成员确认不存在后释放 marker。
+4. 使用 mocked engine metrics 验证 `preUpdate` / `preDelete` 的完整摘流顺序，以及 register / unregister / drain 部分失败时 marker 保留。
+5. 验证 `startup` 模式的现有行为不因模块重构改变，作为兼容性回归。
 
 ### 端到端测试
 
 仅在 mock 集成无法覆盖 Kubernetes 与真实 engine 行为时执行：
 
-1. 真实 RBG controller + Patio + SGLang router 的 create / postReady / update / delete 流程。
+1. 真实 RBG controller + Patio + SGLang router 的 create / postReady / recover / update / delete 流程。
 2. 真实 RBG controller + Patio + vLLM proxy 的 `/instances/add` / `/instances/remove` 流程。
 3. executor 重启、router 重启、Kubernetes API 短暂不可用和 engine 指标暂时不可用。
 4. 版本偏差矩阵：新版 Patio + 未启用 lifecycle 的 RBG、新版 RBG + `startup` Patio、双方均启用 hook。
@@ -779,7 +837,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 1. 注入非法 ENV、缺失 RBAC、403 PATCH、409 conflict、5xx watch、超时、慢 router 响应和 malformed JSON。
 2. 在 heartbeat register 与 unregister 并发时触发 pre hook，验证不会出现 stop 后再注册。
-3. 在 postReady、preUpdate、preDelete marker 相继出现时验证最新 hook-state 抢占旧任务。
+3. 在 postReady、preUpdate、preRecover、preDelete marker 相继出现时验证最新 hook-state 抢占旧任务。
 4. 在 drain 期间修改 state / marker：旧任务停止推进且不清理 marker，新动作按最新 state 执行；同名 RI 重建时动作可幂等重放；多个 marker executor 只清理自己的 key。
 5. 验证不会因 `unknown` / `unsupported`、请求失败或指标抓取失败而误判 idle。
 
@@ -791,7 +849,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 1. 阶段一：完成模块拆分和 adapter 化，但默认仍为 `startup`，所有现有测试保持通过。
 2. 阶段二：发布 `REGISTRY_MODE=hook` 的 alpha 实现，补充 RBAC 示例、部署文档、日志和指标。该阶段要求 SGLang / vLLM 能力矩阵明确。
-3. 阶段三：由 RBG / 编排系统从 Role 的 `labelsHandler` 注入 marker ENV，在测试集群小范围启用，观察 postReady / preUpdate / preDelete。
+3. 阶段三：由 RBG / 编排系统从 Role 的 `labelsHandler` 注入 marker ENV，在测试集群小范围启用，观察 postReady / preRecover / preUpdate / preDelete。
 4. 阶段四：确认无未完成 marker 和 state 后扩大范围。
 5. 回滚：保持 `REGISTRY_MODE=startup` 可用；未完成 hook 时先停止操作并处理 marker，再回滚。不支持通过手动删除 marker 伪报成功作为常规回滚手段。
 6. 废弃：如果后续 RBG marker 协议变化， Patio 使用新 state / marker ABI，不静默兼容同名旧协议。
@@ -801,12 +859,13 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 以下设计决策已确定，不再作为开放问题：
 
 1. hook-state key 使用 `rbg.workloads.x-k8s.io/role-instance-hook-state`；
-2. Patio 只处理 `PreUpdate`、`PreDelete`、`PostReady`；
-3. 不注入、不读取 RI UID，首版不做 UID fencing；
-4. 使用 Pod service account，并只访问 Pod 所在 namespace；
-5. SGLang 使用 list worker 并按 endpoint 幂等删除；vLLM 使用 `/instances/remove`；
-6. 最新 hook-state 永远抢占上一个本地 hook 任务；
-7. drain 默认 1 秒轮询、连续 3 个成功 idle 样本后判定完成。
+2. Patio 处理 `PreUpdate`、`PreRecover`、`PreDelete`、`PostReady`；
+3. `PreRecover` 移除或确认 router 成员不存在，不等待 engine 排空；
+4. 不注入、不读取 RI UID，首版不做 UID fencing；
+5. 使用 Pod service account，并只访问 Pod 所在 namespace；
+6. SGLang 使用 list worker 并按 endpoint 幂等删除；vLLM 使用 `/instances/remove`；
+7. 最新 hook-state 永远抢占上一个本地 hook 任务；
+8. drain 默认 1 秒轮询、连续 3 个成功 idle 样本后判定完成，且只适用于 `preUpdate` / `preDelete`。
 
 当前没有阻塞性设计开放问题。业务自定义排空检查如果后续需要支持，应另立 proposal，定义接口契约、认证边界和失败分类。
 
@@ -816,6 +875,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 - 2026-11-06：对照 proposal 模板补充 User Impact、Compatibility、Observability、Security、Performance、Risks、Drawbacks、Test Plan 和 Rollout；修正 lifecycle state label 不得复用旧 RoleInstanceSet 状态 key，并整理开放问题。
 - 2026-11-06：确认 KEP-527 规范 key 为 `rbg.workloads.x-k8s.io/role-instance-hook-state`；确定不使用 UID fencing、Pod 所在 namespace、SGLang list worker / vLLM remove、最新 hook-state 抢占和 drain 默认参数。
 - 2026-11-06：确定 vLLM 排空必须同时检查 running / waiting / swapped 三个 gauge；首版不支持业务自定义排空检查，后续需要另行 proposal。
+- 2026-11-09：新增 `preRecover` 路由清理：先停止 heartbeat，再 unregister 或确认成员不存在，最后清除 marker；不等待 engine 排空。
 
 ## 参考
 

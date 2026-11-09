@@ -3,16 +3,16 @@
 | Item | Content |
 | --- | --- |
 | Status | draft |
-| Date | Created 2026-11-04; updated 2026-11-06 |
+| Date | Created 2026-11-04; updated 2026-11-09 |
 | Author | inference-engine-runtime maintainers |
 | Reference | `rbg/keps/527-roleinstance-lifecycle/README.md` |
-| Scope | `postReady` bring-up; `preUpdate` / `preDelete` traffic removal and drain |
+| Scope | `postReady` bring-up; `preRecover` route cleanup; `preUpdate` / `preDelete` traffic removal and drain |
 
 ## Summary
 
-The core terms used in this proposal are: RoleInstance (RI) is RBG's instance-level resource; `postReady`, `preUpdate`, and `preDelete` are instance-level lifecycle hooks defined by RBG; a marker is a hook trigger label written by the controller to the RI; `REGISTRY_MODE` is the environment variable that selects Patio's registration control entry point.
+The core terms used in this proposal are: RoleInstance (RI) is RBG's instance-level resource; `postReady`, `preUpdate`, `preRecover`, and `preDelete` are instance-level lifecycle hooks defined by RBG; a marker is a hook trigger label written by the controller to the RI; `REGISTRY_MODE` is the environment variable that selects Patio's registration control entry point.
 
-Patio currently registers a worker with the SGLang router or vLLM proxy immediately after startup and maintains membership through periodic re-registration. That behavior conflicts with RBG's instance-level lifecycle coordination: an instance may receive traffic before `postReady`, and may be re-registered after `preUpdate` or `preDelete` has removed it from routing because of a restart or SIGTERM.
+Patio currently registers a worker with the SGLang router or vLLM proxy immediately after startup and maintains membership through periodic re-registration. That behavior conflicts with RBG's instance-level lifecycle coordination: an instance may receive traffic before `postReady`, may retain stale routing membership when RBG starts Recovery, and may be re-registered after `preUpdate` or `preDelete` has removed it from routing because of a restart or SIGTERM.
 
 This proposal makes registration control configurable through `REGISTRY_MODE`:
 
@@ -20,7 +20,7 @@ This proposal makes registration control configurable through `REGISTRY_MODE`:
 REGISTRY_MODE=startup | hook | none
 ```
 
-The default remains `startup` for compatibility with existing deployments. When set to `hook`, Patio becomes the registration executor for RBG RoleInstance lifecycle hooks: bring-up, removal, and drain are driven by the RoleInstance's `hook-state` and markers, and Patio clears only its own marker after success.
+The default remains `startup` for compatibility with existing deployments. When set to `hook`, Patio becomes the registration executor for RBG RoleInstance lifecycle hooks: bring-up, recovery route cleanup, removal, and drain are driven by the RoleInstance's `hook-state` and markers, and Patio clears only its own marker after success.
 
 ## Motivation
 
@@ -40,33 +40,35 @@ Patio starts
 This is suitable for "register on startup" deployments, but not for instances whose lifecycle is controlled by RBG:
 
 1. An instance may be registered and receive traffic before `postReady`.
-2. After `preUpdate` or `preDelete` removes traffic, a process restart may re-register it.
-3. SIGTERM is a process-level event and does not represent an RBG lifecycle decision.
-4. Endpoint derivation, registration protocol, heartbeat, and signal handling are coupled in `topo_client` and `app.py`.
+2. When RBG starts Recovery, router / proxy membership may still point to the failed instance.
+3. After `preUpdate` or `preDelete` removes traffic, a process restart may re-register it.
+4. SIGTERM is a process-level event and does not represent an RBG lifecycle decision.
+5. Endpoint derivation, registration protocol, heartbeat, and signal handling are coupled in `topo_client` and `app.py`.
 
 ### Goals
 
 1. Preserve existing startup registration behavior by default.
-2. Support marker-driven bring-up and removal coordinated by RBG.
+2. Support marker-driven bring-up, recovery route cleanup, and removal coordinated by RBG.
 3. During removal, stop heartbeat first, wait for the last register call to finish, and then unregister.
-4. Establish common drain semantics, with framework differences interpreted by adapters.
-5. Clarify responsibility boundaries between RBG, the orchestration system, and Patio.
+4. During recovery cleanup, stop heartbeat and remove or confirm the absence of router membership without waiting for engine drain.
+5. Establish common drain semantics for `preUpdate` / `preDelete`, with framework differences interpreted by adapters.
+6. Clarify responsibility boundaries between RBG, the orchestration system, and Patio.
 
 ### Non-Goals
 
 1. Do not modify the RBG API, RoleInstance spec, or controller state machine.
 2. Do not implement executor election, leases, or authorization.
 3. Do not manage Pod finalizers or Pod deletion ordering.
-4. Do not handle `preRecover`.
-5. Do not define member discovery or action aggregation for multi-Pod RoleInstances.
-6. Do not implement business-custom drain checks; additional business constraints require a separate proposal.
+4. Do not define member discovery or action aggregation for multi-Pod RoleInstances.
+5. Do not implement business-custom drain checks; additional business constraints require a separate proposal.
+6. Do not turn `preRecover` into an engine-drain barrier; recovery may be triggered because the engine is already dead.
 
 ### User Impact
 
 | User | Impact | Action required |
 | --- | --- | --- |
-| Kubernetes / RBG operators | Can use `REGISTRY_MODE=hook` to let Patio participate in instance-level bring-up, traffic removal, and drain; failed pre-hooks continue to block the operation | Before enabling, deploy the new Patio version, inject the RI name and marker configuration, and grant minimal Kubernetes API permissions |
-| Application developers | Patio does not register a worker before `postReady`; after `preUpdate` or `preDelete`, restarts and SIGTERM no longer automatically register it. Traffic recovery depends on the RBG hook and router state | Confirm whether the business has long-lived connections, streaming requests, or additional drain requirements |
+| Kubernetes / RBG operators | Can use `REGISTRY_MODE=hook` to let Patio participate in instance-level bring-up, recovery route cleanup, traffic removal, and drain; failed pre-hooks continue to block the operation | Before enabling, deploy the new Patio version, inject the RI name and marker configuration, and grant minimal Kubernetes API permissions |
+| Application developers | Patio does not register a worker before `postReady`; after `preUpdate`, `preRecover`, or `preDelete`, restarts and SIGTERM no longer automatically register it. Traffic recovery depends on the RBG hook and router state | Confirm whether the business has long-lived connections, streaming requests, or additional drain requirements |
 | SGLang / vLLM integrators | Registration is split into adapters and must provide confirmable unregister and drain state | Confirm router / proxy APIs and metric semantics |
 | Patio maintainers | `topo` responsibilities are split into endpoint, registration, runtime, heartbeat, and lifecycle; Kubernetes watch / patch logic is added | Implement and test the new module boundaries |
 
@@ -87,6 +89,12 @@ so that RBG can safely replace or delete the RoleInstance.
 ```
 
 ```text
+As a Kubernetes operator,
+I want Patio to remove stale router membership before RBG Recovery without waiting for engine drain,
+so that a dead instance is not selected for traffic while RBG rebuilds it.
+```
+
+```text
 As an SGLang/vLLM integration developer,
 I want registration and drain behavior represented by explicit adapters,
 so that framework differences do not leak into the lifecycle state machine.
@@ -98,7 +106,7 @@ so that framework differences do not leak into the lifecycle state machine.
 | --- | --- |
 | Patio | The runtime process of this inference-engine-runtime project, running as an inference engine sidecar |
 | RoleInstance (RI) | RBG's instance-level resource; one RI represents one inference instance. This proposal initially supports one Pod and one executor |
-| `hook-state` | The phase label written by the RBG controller to `rbg.workloads.x-k8s.io/role-instance-hook-state`, such as `PreUpdate`, `PreDelete`, or `PostReady` |
+| `hook-state` | The phase label written by the RBG controller to `rbg.workloads.x-k8s.io/role-instance-hook-state`, such as `PreUpdate`, `PreRecover`, `PreDelete`, or `PostReady` |
 | Marker | A `key=value` RI label that tells an executor to handle a hook; the executor removes its own marker after completion |
 | Hook executor | A component that watches markers, performs actions, and clears markers. In this proposal, Patio is the registration hook executor |
 | Registration | The protocol for adding or removing a worker from the router or proxy member list |
@@ -265,9 +273,11 @@ Heartbeat is a self-healing periodic register, not a removal controller:
 1. `start()` periodically calls register;
 2. after `stop()`, no new register is scheduled;
 3. start / stop is idempotent;
-4. `preUpdate` / `preDelete` stops heartbeat first;
+4. `preUpdate`, `preRecover`, and `preDelete` stop heartbeat first;
 5. wait for the last register request to finish before unregistering;
 6. `postReady` starts heartbeat after registration.
+
+`preRecover` intentionally does not wait for engine drain: Recovery may have been triggered because the engine is dead, so requiring idle engine metrics would deadlock the operation.
 
 While heartbeat is running, a failed register can be retried by the next heartbeat; the registration primitive does not need an additional long retry.
 
@@ -291,10 +301,11 @@ The lifecycle hook-state label is fixed to the KEP-527 normative value:
 rbg.workloads.x-k8s.io/role-instance-hook-state
 ```
 
-Patio handles only the three states in this proposal:
+Patio handles only the four states in this proposal:
 
 ```text
 PreUpdate
+PreRecover
 PreDelete
 PostReady
 ```
@@ -309,7 +320,7 @@ When `REGISTRY_MODE=hook`:
 2. Patio watches the specified RoleInstance.
 3. An action is executed only when both `hook-state` and the marker match.
 4. Before an action with side effects, Patio GETs the latest RI and reconfirms state and marker.
-5. Patio performs register / unregister / drain.
+5. Patio performs the register, unregister, route-cleanup, or drain action required by that hook.
 6. On success, Patio deletes only its own marker.
 7. The RBG controller decides whether to continue based on whether the marker still matches.
 
@@ -378,7 +389,7 @@ REGISTRY_MODE=startup
 | Mode | Meaning |
 | --- | --- |
 | `startup` | Preserve current behavior: wait for engine readiness on startup, register, and start heartbeat; do not process lifecycle markers |
-| `hook` | This instance is the designated registration hook executor: do not register on startup, do not start heartbeat, and drive register / unregister / drain from markers while clearing only this executor's marker |
+| `hook` | This instance is the designated registration hook executor: do not register on startup, do not start heartbeat, and drive register / unregister / recovery route cleanup / drain from markers while clearing only this executor's marker |
 | `none` | Do not register, start heartbeat, or process lifecycle markers |
 
 `hook` and `startup` are mutually exclusive, preventing a restart after traffic removal from being re-registered by startup logic.
@@ -392,6 +403,7 @@ The RBG / orchestration system designates the hook executor by injecting `REGIST
 | `REGISTRY_MODE` | Optional; default `startup` | Registration control mode |
 | `LIFECYCLE_RI_NAME` | Required when `REGISTRY_MODE=hook` | RoleInstance name to watch |
 | `LIFECYCLE_PRE_UPDATE_MARKER` | At least one marker in hook mode | `preUpdate` trigger marker |
+| `LIFECYCLE_PRE_RECOVER_MARKER` | At least one marker in hook mode | `preRecover` trigger marker |
 | `LIFECYCLE_POST_READY_MARKER` | At least one marker in hook mode | `postReady` trigger marker |
 | `LIFECYCLE_PRE_DELETE_MARKER` | At least one marker in hook mode | `preDelete` trigger marker |
 | `LIFECYCLE_DRAIN_CHECK_INTERVAL` | Optional; default `1s` | Drain snapshot polling interval |
@@ -401,6 +413,7 @@ Marker examples:
 
 ```text
 LIFECYCLE_PRE_UPDATE_MARKER=patio.engine/update-block=true
+LIFECYCLE_PRE_RECOVER_MARKER=patio.engine/recover-block=true
 LIFECYCLE_POST_READY_MARKER=patio.engine/ready-block=true
 LIFECYCLE_PRE_DELETE_MARKER=patio.engine/delete-block=true
 ```
@@ -478,9 +491,11 @@ async def run(role_instance_name, markers, runtime):
         if event.state == "PostReady" and event.matches(markers.post_ready):
             await handle_post_ready(event, runtime, markers.post_ready)
 
-        elif event.state in ("PreUpdate", "PreDelete"):
+        elif event.state in ("PreUpdate", "PreRecover", "PreDelete"):
             if event.state == "PreUpdate" and event.matches(markers.pre_update):
                 await handle_pre_hook(event, runtime, markers.pre_update)
+            elif event.state == "PreRecover" and event.matches(markers.pre_recover):
+                await handle_pre_recover(event, runtime, markers.pre_recover)
             elif event.state == "PreDelete" and event.matches(markers.pre_delete):
                 await handle_pre_hook(event, runtime, markers.pre_delete)
 ```
@@ -566,7 +581,46 @@ High-level success conditions:
 5. Business-custom drain checks are not executed in the first version; additional business constraints require a future extension.
 6. State and marker still match immediately before marker deletion.
 
-### 4.5 Drain snapshot
+### 4.5 `preRecover` route cleanup
+
+Trigger:
+
+```text
+hook-state=PreRecover
+preRecover marker matches
+```
+
+```python
+async def handle_pre_recover(event, runtime, marker):
+    runtime.begin_recover_cleanup()
+
+    await runtime.heartbeat.stop(wait_inflight=True)
+    await runtime.unregister_or_confirm_absent()
+
+    await marker.clear_if_still_matching(event)
+```
+
+Execution order:
+
+```text
+preRecover marker
+  -> heartbeat.stop()
+  -> wait for last register
+  -> unregister or confirm member absent
+  -> clear own marker
+```
+
+`preRecover` does not call `wait_until_drained()`. Recovery may be triggered because the engine is dead; an unreachable `/metrics` endpoint, missing engine metrics, or an `unknown` / `unsupported` drain snapshot is not a reason to retain the marker after router membership has been removed or confirmed absent.
+
+Success requires all of the following:
+
+1. Heartbeat is stopped and the last in-flight register has completed or been canceled without scheduling a new registration.
+2. The router / proxy member is removed, or confirmed never to have existed.
+3. The current `hook-state` and marker still match immediately before marker deletion.
+
+If heartbeat stop or router removal cannot be confirmed, keep the marker and retry the idempotent action with bounded backoff. After Patio clears the marker, RBG performs the actual Recovery; after the recovered workload reaches Ready, the same `postReady` path registers the worker and starts heartbeat.
+
+### 4.6 Drain snapshot
 
 The runtime defines common drain semantics; each inference framework adapter interprets what is active, queued, or drained.
 
@@ -631,7 +685,7 @@ vLLM metrics can cover streaming requests still generating, but cannot cover HTT
 - Injecting `REGISTRY_MODE`, the RI name, and marker environment variables;
 - Managing RoleInstance lifecycle state and marker writes;
 - Managing Pod finalizers and deletion ordering;
-- Ensuring the executor remains available before the business Pod is deleted;
+- Ensuring the executor remains available while preRecover and preDelete markers must be processed;
 - Handling controller / executor failure recovery.
 
 ### Patio is responsible for
@@ -640,13 +694,14 @@ vLLM metrics can cover streaming requests still generating, but cannot cover HTT
 - Matching state and marker;
 - Calling register / unregister;
 - Controlling heartbeat start / stop;
-- Performing drain checks;
+- Performing preRecover route cleanup without engine drain;
+- Performing preUpdate / preDelete drain checks;
 - Clearing its own marker.
 
 ### Current limitations
 
 1. Multi-Pod RI member discovery and action invocation require an RBG definition. This proposal defines only one Pod / one executor semantics and no member discovery.
-2. The first version does not implement business-custom drain checks. Default engine metrics cannot cover idle HTTP / SSE / WebSocket long connections, router / proxy internal buffers, or external business transactions; these constraints require a separate extension proposal.
+2. The first version does not implement business-custom drain checks for `preUpdate` / `preDelete`. Default engine metrics cannot cover idle HTTP / SSE / WebSocket long connections, router / proxy internal buffers, or external business transactions; these constraints require a separate extension proposal. `preRecover` intentionally does not use engine drain metrics.
 3. The first version does not use RI UID fencing; it relies on RBG's preDelete finalizer and Patio action idempotency for same-name delete/recreate.
 
 ## Compatibility
@@ -654,7 +709,7 @@ vLLM metrics can cover streaming requests still generating, but cannot cover HTT
 1. `REGISTRY_MODE` defaults to `startup`; deployments that do not explicitly enable hook mode retain registration, heartbeat, and signal behavior.
 2. The `topo` refactor is internal; `TOPO_TYPE`, `--instance-info`, router endpoint derivation, and the existing registration protocol remain compatible in startup mode.
 3. Hook mode requires an RBG controller implementing KEP-527's Role-level lifecycle protocol, `role-instance-hook-state`, and marker writes. Patio is incompatible with deployments that only implement the old RIS `PreparingUpdate` / `PreparingDelete` state machine.
-4. The SGLang router must provide worker listing and identify/delete members by stable worker endpoint; the vLLM proxy must provide `/instances/remove`. If a deployed version lacks these capabilities, the pre-hook fails closed rather than ignoring unregister.
+4. The SGLang router must provide worker listing and identify/delete members by stable worker endpoint; the vLLM proxy must provide `/instances/remove`. If a deployed version lacks these capabilities, the pre-hook fails closed rather than ignoring unregister. This applies to `preRecover` route cleanup as well, even though it does not require engine metrics.
 5. Version skew requires upgrading Patio / router / proxy capabilities before deploying RBG hook configuration and `REGISTRY_MODE=hook`. RBG and Patio must agree on state key, state values, and marker matching semantics.
 6. During downgrade or rollback, an instance with a matching marker cannot simply be switched back to `startup`. Stop new RBG operations, wait for or explicitly handle unfinished hooks, confirm no residual `hook-state` / marker, then remove hook configuration or roll back Patio.
 7. New metrics and logs are additive; existing metric names are not guaranteed unchanged. Removal or renaming will be documented separately.
@@ -663,7 +718,7 @@ vLLM metrics can cover streaming requests still generating, but cannot cover HTT
 
 ## Observability
 
-Logs must record configuration parsing, watch establish / disconnect / reconnect, hook triggers, register / unregister results, drain snapshots, marker cleanup results, and failure reasons. Logs must not output service account tokens or other sensitive configuration.
+Logs must record configuration parsing, watch establish / disconnect / reconnect, hook triggers, register / unregister results, recovery route cleanup, drain snapshots, marker cleanup results, and failure reasons. Logs must not output service account tokens or other sensitive configuration.
 
 Proposed metrics:
 
@@ -671,8 +726,8 @@ Proposed metrics:
 | --- | --- | --- | --- |
 | `patio_lifecycle_event_total` | Counter | `state`, `matched` | RI events received and whether state / marker matched |
 | `patio_lifecycle_action_total` | Counter | `hook`, `result` | Hook action success, failure, and cancellation counts |
-| `patio_lifecycle_action_duration_seconds` | Histogram | `hook`, `phase` | Duration of register, unregister, drain, and marker clearing |
-| `patio_registration_state` | Gauge | `engine`, `protocol` | Current local traffic state: unregistered, registering, serving, draining, unregister unconfirmed |
+| `patio_lifecycle_action_duration_seconds` | Histogram | `hook`, `phase` | Duration of register, unregister, recovery route cleanup, drain, and marker clearing |
+| `patio_registration_state` | Gauge | `engine`, `protocol` | Current local traffic state: unregistered, registering, serving, draining, recover-cleanup, unregister unconfirmed |
 | `patio_drain_state` | Gauge | `engine`, `source` | Adapter-reported idle / draining / unknown / unsupported |
 | `patio_lifecycle_watch_errors_total` | Counter | `operation`, `reason` | Watch / patch / get failures |
 
@@ -682,7 +737,7 @@ Patio HTTP health / readiness must not automatically fail while a hook is proces
 
 Troubleshooting:
 
-1. A pre-hook marker remains for a long time: check whether Patio is running in `REGISTRY_MODE=hook`, whether watch is healthy, action failure logs, router / proxy reachability, and whether drain is `unknown` / `unsupported`.
+1. A pre-hook marker remains for a long time: check whether Patio is running in `REGISTRY_MODE=hook`, whether watch is healthy, action failure logs, router / proxy reachability. For `preUpdate` / `preDelete`, also check whether drain is `unknown` / `unsupported`; for `preRecover`, engine metrics are not part of the success condition.
 2. A `postReady` marker remains for a long time: check engine readiness, register failures, and heartbeat state; it does not mean the controller is blocked.
 3. An instance receives no traffic: check whether Patio received the postReady marker, whether marker configuration matches RBG's effective configuration, router membership, and heartbeat.
 4. The controller does not advance: check whether markers belonging to other executors remain; Patio clears only its own marker.
@@ -714,6 +769,7 @@ Troubleshooting:
 | Marker / state configuration differs from RBG effective configuration | Markers do not match or are incorrectly cleared | matched / action metrics, startup logs | Orchestration injects ENV from `labelsHandler`; validate format at startup and test mismatches |
 | Stale watch event or same-name RI recreation | register / unregister based on an old object | resourceVersion logs, registration state | GET latest and recheck before side effects; rely on preDelete finalizer and idempotency, with no first-version UID fencing |
 | Executor restart during a pre-hook | Action repeats or is interrupted | Action results, process restart logs | Register / unregister must be idempotent; marker remains and is replayed after restart |
+| Executor unavailable during preRecover | Recovery marker cannot be cleared; actual recovery is blocked | Marker age and executor process logs | Orchestration must keep the executor available while preRecover markers must be processed; otherwise do not assign preRecover to Patio or use a separate executor |
 | Missing or unparsable engine metrics | Idle cannot be confirmed; pre-hook waits indefinitely | Drain state metrics | `unknown` / `unsupported` fail closed; logs and metrics aid diagnosis |
 | Long-lived / streaming requests not counted as active | Marker cleared too early and requests interrupted | Business error rate, drain duration distribution | Metrics are only the first-version default; businesses may extend custom checks and must explicitly evaluate long streaming workloads |
 | Executor accidentally configured as `startup` | Restart after drain automatically registers again | Registry state / heartbeat logs | Hook mode must be explicit; deployment docs and configuration validation prevent silent fallback |
@@ -730,7 +786,7 @@ Troubleshooting:
 
 ### Keep only startup registration
 
-The change is minimal, but Patio cannot coordinate with `postReady` / `preUpdate` / `preDelete` or safely remove and drain traffic.
+The change is minimal, but Patio cannot coordinate with `postReady` / `preUpdate` / `preRecover` / `preDelete`, safely clean stale routes during recovery, or safely remove and drain traffic.
 
 ### RBG controller calls Patio HTTP directly
 
@@ -750,27 +806,29 @@ This could automatically choose an executor, but introduces leases, authorizatio
 
 1. `REGISTRY_MODE`: default `startup`; reject invalid values; reject hook mode without RI name or markers.
 2. marker `key=value`: split on first `=`; reject empty key, invalid label key / value, duplicate configuration, and empty value.
-3. RI event dispatch: `PreUpdate`, `PreDelete`, and `PostReady` must match markers; old marker alone does not trigger; unknown states are ignored; duplicate events trigger only idempotent processing.
+3. RI event dispatch: `PreUpdate`, `PreRecover`, `PreDelete`, and `PostReady` must match markers; old marker alone does not trigger; unknown states are ignored; duplicate events trigger only idempotent processing.
 4. Traffic state machine: postReady starts heartbeat after successful register; pre-hook stops heartbeat, waits for inflight register, then unregisters; latest hook-state preemption does not clear the old marker.
-5. Heartbeat: start / stop are idempotent; stop schedules no new calls; the last register can be awaited; heartbeat errors do not change drain state.
-6. Marker cleanup: JSON Merge Patch deletes only its own key; no PATCH after state or marker changes; handle missing object, missing marker, and PATCH conflict.
-7. Drain adapter: reachable `/metrics` with missing required metrics returns `unsupported`; network failure, timeout, 5xx, NaN, non-numeric, or parse failure returns `unknown`; neither is idle and both reset the stable count.
-8. vLLM drain: running / waiting zero but swapped greater than zero is not idle; all three zero for the stable sample count is idle.
-9. SGLang drain: running or queue greater than zero is not idle; both zero for the stable sample count is idle.
-10. Signals: SIGTERM / SIGINT behavior in all three modes; hook-mode interruption keeps the marker and does not unregister.
+5. `preRecover`: stops heartbeat, unregisters or confirms member absence, and does not invoke engine drain; `unknown` / `unsupported` engine metrics do not retain the marker after router cleanup is confirmed; heartbeat remains stopped on retry.
+6. Heartbeat: start / stop are idempotent; stop schedules no new calls; the last register can be awaited; heartbeat errors do not change drain state.
+7. Marker cleanup: JSON Merge Patch deletes only its own key; no PATCH after state or marker changes; handle missing object, missing marker, and PATCH conflict.
+8. Drain adapter: reachable `/metrics` with missing required metrics returns `unsupported`; network failure, timeout, 5xx, NaN, non-numeric, or parse failure returns `unknown`; neither is idle and both reset the stable count.
+9. vLLM drain: running / waiting zero but swapped greater than zero is not idle; all three zero for the stable sample count is idle.
+10. SGLang drain: running or queue greater than zero is not idle; both zero for the stable sample count is idle.
+11. Signals: SIGTERM / SIGINT behavior in all three modes; hook-mode interruption keeps the marker and does not unregister.
 
 ### Integration tests
 
 1. Use a fake Kubernetes API server for a single-RI watch, covering LIST/WATCH reconnect, resourceVersion expiry, stale events, marker PATCH failure, and object deletion.
 2. Use mocked SGLang router / vLLM proxy to verify idempotent register and unregister, remove failure, lost handles after process restart, and heartbeat recovery after router restart.
-3. Use mocked engine metrics to verify the complete `preUpdate` / `preDelete` order and marker retention after partial register / unregister / drain failure.
-4. Verify that startup-mode behavior is unchanged by the refactor as a compatibility regression.
+3. Use mocked SGLang router / vLLM proxy and an unreachable engine metrics endpoint to verify the complete `preRecover` cleanup order, including marker release after member absence is confirmed.
+4. Use mocked engine metrics to verify the complete `preUpdate` / `preDelete` order and marker retention after partial register / unregister / drain failure.
+5. Verify that startup-mode behavior is unchanged by the refactor as a compatibility regression.
 
 ### End-to-end tests
 
 Only when mock integration cannot cover Kubernetes and real engine behavior:
 
-1. Real RBG controller + Patio + SGLang router create / postReady / update / delete flow.
+1. Real RBG controller + Patio + SGLang router create / postReady / recover / update / delete flow.
 2. Real RBG controller + Patio + vLLM proxy `/instances/add` / `/instances/remove` flow.
 3. Executor restart, router restart, transient Kubernetes API unavailability, and transient engine metric unavailability.
 4. Version-skew matrix: new Patio + RBG without lifecycle enabled, new RBG + startup Patio, and both with hook enabled.
@@ -779,7 +837,7 @@ Only when mock integration cannot cover Kubernetes and real engine behavior:
 
 1. Inject invalid ENV, missing RBAC, 403 PATCH, 409 conflict, 5xx watch, timeout, slow router response, and malformed JSON.
 2. Trigger a pre-hook while heartbeat register and unregister run concurrently; verify no post-stop registration.
-3. Present postReady, preUpdate, and preDelete markers in sequence; verify latest hook-state preempts the old task.
+3. Present postReady, preUpdate, preRecover, and preDelete markers in sequence; verify latest hook-state preempts the old task.
 4. Change state / marker during drain: old task stops without clearing marker and the new action follows the latest state; same-name RI recreation replays idempotently; multiple executors clear only their own keys.
 5. Verify that `unknown` / `unsupported`, request failure, or metric scrape failure cannot be misclassified as idle.
 
@@ -791,7 +849,7 @@ This proposal does not promise a business drain-time SLO. At large instance coun
 
 1. Phase 1: complete module separation and adapterization while defaulting to `startup`; all existing tests continue to pass.
 2. Phase 2: release the alpha `REGISTRY_MODE=hook` implementation with RBAC examples, deployment docs, logs, and metrics. The SGLang / vLLM capability matrix must be clear.
-3. Phase 3: have RBG / orchestration inject marker ENV from Role `labelsHandler`, enable in a test cluster, and observe postReady / preUpdate / preDelete.
+3. Phase 3: have RBG / orchestration inject marker ENV from Role `labelsHandler`, enable in a test cluster, and observe postReady / preRecover / preUpdate / preDelete.
 4. Phase 4: expand after confirming no unfinished markers or states.
 5. Rollback: keep `REGISTRY_MODE=startup` available; with unfinished hooks, stop operations and handle markers before rollback. Manually deleting markers to fake success is not a routine rollback method.
 6. Deprecation: if the RBG marker protocol changes, use the new state / marker ABI rather than silently supporting the same-named old protocol.
@@ -801,12 +859,13 @@ This proposal does not promise a business drain-time SLO. At large instance coun
 The following design decisions are settled:
 
 1. hook-state key is `rbg.workloads.x-k8s.io/role-instance-hook-state`.
-2. Patio handles only `PreUpdate`, `PreDelete`, and `PostReady`.
-3. RI UID is not injected or read; first version has no UID fencing.
-4. Patio uses the Pod service account and accesses only the Pod's namespace.
-5. SGLang uses worker listing and endpoint-based idempotent delete; vLLM uses `/instances/remove`.
-6. The latest hook-state always preempts the previous local hook task.
-7. Drain defaults to one-second polling and three consecutive successful idle samples.
+2. Patio handles `PreUpdate`, `PreRecover`, `PreDelete`, and `PostReady`.
+3. `PreRecover` removes or confirms the absence of router membership without engine drain.
+4. RI UID is not injected or read; first version has no UID fencing.
+5. Patio uses the Pod service account and accesses only the Pod's namespace.
+6. SGLang uses worker listing and endpoint-based idempotent delete; vLLM uses `/instances/remove`.
+7. The latest hook-state always preempts the previous local hook task.
+8. Drain defaults to one-second polling and three consecutive successful idle samples and applies only to `preUpdate` / `preDelete`.
 
 There are no blocking design questions. If business-custom drain checks are needed later, submit a separate proposal defining the interface contract, authentication boundary, and failure classification.
 
@@ -816,6 +875,7 @@ There are no blocking design questions. If business-custom drain checks are need
 - 2026-11-06: Added User Impact, Compatibility, Observability, Security, Performance, Risks, Drawbacks, Test Plan, and Rollout; corrected that lifecycle state must not reuse the old RoleInstanceSet key and organized open questions.
 - 2026-11-06: Confirmed the KEP-527 key `rbg.workloads.x-k8s.io/role-instance-hook-state`; settled no UID fencing, Pod namespace only, SGLang list-worker / vLLM remove, latest hook-state preemption, and default drain parameters.
 - 2026-11-06: Settled that vLLM drain must check running / waiting / swapped gauges and that business-custom drain checks require a future proposal.
+- 2026-11-09: Added `preRecover` route cleanup: stop heartbeat, unregister or confirm absence, and clear the marker without waiting for engine drain.
 
 ## References
 
