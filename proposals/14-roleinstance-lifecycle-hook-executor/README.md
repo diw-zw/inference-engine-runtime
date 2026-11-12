@@ -1,26 +1,24 @@
-# Proposal 14: Patio as RoleInstance Lifecycle Hook Executor
+# Proposal 14: Patio as RoleInstance Callback Executor
 
 | Item | Content |
 | --- | --- |
 | Status | draft |
-| Date | Created 2026-11-04; updated 2026-11-09 |
+| Date | Created 2026-11-04; updated 2026-11-11 |
 | Author | inference-engine-runtime maintainers |
-| Reference | `rbg/keps/527-roleinstance-lifecycle/README.md` |
-| Scope | `postReady` bring-up; `preRecover` route cleanup; `preUpdate` / `preDelete` traffic removal and drain |
+| Reference | `rbg/keps/527-roleinstance-lifecycle/README.zh-CN.md` |
+| Scope | Patio defines callbacks and RBG invokes them through signalLabels; routing onboarding, offboarding, and drain are the initial capabilities |
 
 ## Summary
 
-The core terms used in this proposal are: RoleInstance (RI) is RBG's instance-level resource; `postReady`, `preUpdate`, `preRecover`, and `preDelete` are instance-level lifecycle hooks defined by RBG; a marker is a hook trigger label written by the controller to the RI; `REGISTRY_MODE` is the environment variable that selects Patio's registration control entry point.
+This proposal splits business capabilities into independent asynchronous Callback plugins. Patio configures only ordered callback-name lists for `start` and `end`, plus an ordered `signalLabel -> callback` binding list. RBG signals invocation by writing signalLabels. A unified Executor runs startup, signalLabel-triggered, and shutdown operations. Inputs received by hooks are collectively called signals; signalLabel is currently the only signal implementation.
 
-Patio currently registers a worker with the SGLang router or vLLM proxy immediately after startup and maintains membership through periodic re-registration. That behavior conflicts with RBG's instance-level lifecycle coordination: an instance may receive traffic before `postReady`, may retain stale routing membership when RBG starts Recovery, and may be re-registered after `preUpdate` or `preDelete` has removed it from routing because of a restart or SIGTERM.
-
-This proposal makes registration control configurable through `REGISTRY_MODE`:
+RoleInstance (RI) is RBG's instance-level resource. A signalLabel is a `key=value` trigger written into RI labels by the orchestration system. Patio directly LISTs/WATCHes the RI, detects signalLabels in configuration order, executes matching callbacks serially, and clears each corresponding signalLabel after success. Each signalLabel binds only one callback; multiple operations use different signalLabels.
 
 ```text
-REGISTRY_MODE=startup | hook | none
+Process starts -> register plugins and validate configuration -> run start callbacks
+  -> watch RI labels -> match, execute, and clear signalLabels in configuration order
+  -> receive SIGTERM / SIGINT -> run end callbacks -> exit
 ```
-
-The default remains `startup` for compatibility with existing deployments. When set to `hook`, Patio becomes the registration executor for RBG RoleInstance lifecycle hooks: bring-up, recovery route cleanup, removal, and drain are driven by the RoleInstance's `hook-state` and markers, and Patio clears only its own marker after success.
 
 ## Motivation
 
@@ -37,40 +35,41 @@ Patio starts
   -> unregister on SIGTERM / SIGINT
 ```
 
-This is suitable for "register on startup" deployments, but not for instances whose lifecycle is controlled by RBG:
+This suits "onboard at startup" deployments, but not instance lifecycles controlled by RBG:
 
-1. An instance may be registered and receive traffic before `postReady`.
-2. When RBG starts Recovery, router / proxy membership may still point to the failed instance.
-3. After `preUpdate` or `preDelete` removes traffic, a process restart may re-register it.
-4. SIGTERM is a process-level event and does not represent an RBG lifecycle decision.
-5. Endpoint derivation, registration protocol, heartbeat, and signal handling are coupled in `topo_client` and `app.py`.
+1. An instance may already be registered and receiving traffic before RBG allows traffic admission.
+2. When RBG starts rebuilding, router / proxy membership may still point to the failed instance.
+3. After RBG requests traffic removal, a process restart may register the instance again.
+4. SIGTERM is a process event, not an RBG lifecycle signal.
+5. Endpoint derivation, the registration protocol, heartbeat, and signal handling are coupled in `topo_client` / `app.py`.
 
 ### Goals
 
-1. Preserve existing startup registration behavior by default.
-2. Support marker-driven bring-up, recovery route cleanup, and removal coordinated by RBG.
-3. During removal, stop heartbeat first, wait for the last register call to finish, and then unregister.
-4. During recovery cleanup, stop heartbeat and remove or confirm the absence of router membership without waiting for engine drain.
-5. Establish common drain semantics for `preUpdate` / `preDelete`, with framework differences interpreted by adapters.
-6. Clarify responsibility boundaries between RBG, the orchestration system, and Patio.
+1. Use the same Executor for start, signalLabel callbacks, and end. Preserve existing startup behavior through default bindings without adding mode branches.
+2. Support independent callback registration and reuse, with users configuring operations and their order directly.
+3. Give each operation its own signalLabel. Orchestration writes dependent signalLabels together, and Patio processes them serially in configuration order without bypassing failures.
+4. Inside an offboarding callback, stop heartbeat first, wait for the last register to complete, and then unregister. If drain is required, continue waiting for drain.
+5. Provide a route-cleanup callback that does not wait for engine drain, for use before recovery or during shutdown.
+6. Keep the Executor limited to the signalLabel protocol. Adapters interpret framework differences, and the deployment configures which signal invokes which callback.
 
 ### Non-Goals
 
 1. Do not modify the RBG API, RoleInstance spec, or controller state machine.
-2. Do not implement executor election, leases, or authorization.
+2. Do not implement Executor election, leases, or authorization.
 3. Do not manage Pod finalizers or Pod deletion ordering.
-4. Do not define member discovery or action aggregation for multi-Pod RoleInstances.
-5. Do not implement business-custom drain checks; additional business constraints require a separate proposal.
-6. Do not turn `preRecover` into an engine-drain barrier; recovery may be triggered because the engine is already dead.
+4. Do not define member discovery or action aggregation protocols for multi-Pod RoleInstances.
+5. The initial built-in plugins do not implement business-custom drain checks or KVCache save and restore. The business contracts for such plugins are defined separately.
+6. Do not implement arbitrary script execution, dynamic Python module imports through YAML, cross-Executor global ordering, or a general dependency DAG.
+7. Do not implement Recovery cleanup as an engine-drain barrier; the engine may already be dead.
 
 ### User Impact
 
 | User | Impact | Action required |
 | --- | --- | --- |
-| Kubernetes / RBG operators | Can use `REGISTRY_MODE=hook` to let Patio participate in instance-level bring-up, recovery route cleanup, traffic removal, and drain; failed pre-hooks continue to block the operation | Before enabling, deploy the new Patio version, inject the RI name and marker configuration, and grant minimal Kubernetes API permissions |
-| Application developers | Patio does not register a worker before `postReady`; after `preUpdate`, `preRecover`, or `preDelete`, restarts and SIGTERM no longer automatically register it. Traffic recovery depends on the RBG hook and router state | Confirm whether the business has long-lived connections, streaming requests, or additional drain requirements |
-| SGLang / vLLM integrators | Registration is split into adapters and must provide confirmable unregister and drain state | Confirm router / proxy APIs and metric semantics |
-| Patio maintainers | `topo` responsibilities are split into endpoint, registration, runtime, heartbeat, and lifecycle; Kubernetes watch / patch logic is added | Implement and test the new module boundaries |
+| Kubernetes / RBG operators | Configure signalLabels and operations through `event_callbacks`; failures retain signalLabels and block subsequent bindings | Inject configuration and the RI name, configure RBAC, and guarantee signalLabel grouping, ordering, and unique ownership |
+| Application developers | Configuration determines onboarding at startup and offboarding at shutdown, rather than implicit modes | Omit `router_onboard` from start when RBG controls onboarding; confirm long-lived connection and drain requirements |
+| SGLang / vLLM integration developers | Protocol adapters must provide confirmable unregister and drain state | Confirm router / proxy APIs and metric semantics |
+| Patio maintainers | Add a shared plugin registry, unified Executor, and RI observation layer | Remove legacy startup registration and signal-handling bypasses to avoid duplicate execution |
 
 ## Proposal
 
@@ -78,49 +77,57 @@ This is suitable for "register on startup" deployments, but not for instances wh
 
 ```text
 As a Kubernetes operator,
-I want Patio to register an inference worker only after RBG postReady,
-so that the instance does not receive traffic before the controlled operation is ready.
+I want Patio to register an inference worker only after RBG issues the onboarding signal,
+so that the instance does not receive traffic before controlled operations are ready.
 ```
 
 ```text
 As a Kubernetes operator,
-I want Patio to stop heartbeat registration, unregister, and drain requests before update or delete,
+I want Patio to stop heartbeat registration, unregister, and drain requests before update or deletion,
 so that RBG can safely replace or delete the RoleInstance.
 ```
 
 ```text
 As a Kubernetes operator,
 I want Patio to remove stale router membership before RBG Recovery without waiting for engine drain,
-so that a dead instance is not selected for traffic while RBG rebuilds it.
+so that the router does not continue forwarding traffic to a dead instance while RBG rebuilds it.
 ```
 
 ```text
-As an SGLang/vLLM integration developer,
-I want registration and drain behavior represented by explicit adapters,
-so that framework differences do not leak into the lifecycle state machine.
+As an SGLang / vLLM integration developer,
+I want registration and drain behavior expressed through explicit adapters,
+so that framework differences do not leak into signalLabel scheduling logic.
+```
+
+```text
+As a plugin developer,
+I want independent operations reusable at startup, shutdown, and arbitrary signalLabels,
+and I want configuration order across different signalLabels to express removal before saving and restoration before onboarding.
 ```
 
 ## Terminology
 
 | Term | Meaning |
 | --- | --- |
-| Patio | The runtime process of this inference-engine-runtime project, running as an inference engine sidecar |
-| RoleInstance (RI) | RBG's instance-level resource; one RI represents one inference instance. This proposal initially supports one Pod and one executor |
-| `hook-state` | The phase label written by the RBG controller to `rbg.workloads.x-k8s.io/role-instance-hook-state`, such as `PreUpdate`, `PreRecover`, `PreDelete`, or `PostReady` |
-| Marker | A `key=value` RI label that tells an executor to handle a hook; the executor removes its own marker after completion |
-| Hook executor | A component that watches markers, performs actions, and clears markers. In this proposal, Patio is the registration hook executor |
-| Registration | The protocol for adding or removing a worker from the router or proxy member list |
-| Endpoint | The address used to access the router / proxy, worker, or engine health |
-| Heartbeat | A self-healing mechanism that periodically calls register to recover after router restart |
-| Drain | After removal from the router / proxy, waiting for assigned requests to complete |
-| Fail closed | When the result cannot be confirmed, remain blocked and do not clear the marker, allowing the controller to continue waiting |
-| `REGISTRY_MODE` | Patio environment variable selecting the registration control entry point: startup registration, hook-driven registration, or no registration |
+| Patio | The runtime process of this inference-engine-runtime project, running as an inference engine sidecar. |
+| RoleInstance (RI) | RBG's instance-level resource. One RI represents one inference instance. The first version of this proposal supports only one Pod and one Executor. |
+| signal | The trigger input received by a hook; its source is not limited to RI labels. |
+| signalLabel | A signal implementation whose value is a `key=value` RI label. Each operation is triggered and acknowledged independently, and the unique Executor deletes the signalLabel after success. |
+| Callback plugin | An independent asynchronous operation registered by name. It is unaware of RBG hooks and signalLabels and is not responsible for Kubernetes writeback. |
+| `HookBinding` | A binding between one signal source and one callback. The current signal source is signalLabel, and list order defines detection and serial processing order. |
+| Executor | The component that runs start / end callbacks, observes the RI, executes matching callbacks in order, retries, and clears signalLabels. |
+| registration | The protocol for a worker to join or leave the router or proxy member list. |
+| endpoint | The access address for the router / proxy, worker, or engine health. |
+| heartbeat | A self-healing mechanism that periodically calls register to restore registration after a router restart. |
+| drain | After removal from router / proxy membership, the process of waiting for assigned requests to complete. |
+| fail closed | When a result cannot be confirmed, remain blocked, do not clear the signalLabel, and let the controller continue waiting. |
+| start / end | Process startup and termination events, not RBG hooks. |
 
-## 1. Architecture Changes
+## Architecture Changes
 
-### 1.1 Current architecture
+### Current architecture
 
-The current `topo_client` is responsible for:
+The current `topo_client` handles all of the following:
 
 - endpoint derivation;
 - engine health waiting;
@@ -128,49 +135,30 @@ The current `topo_client` is responsible for:
 - heartbeat re-registration;
 - SIGTERM unregistration.
 
-It is neither an RI-level traffic controller nor a lifecycle executor.
+It is neither an RI-level traffic controller nor a lifecycle Executor.
 
-### 1.2 Target architecture
+### Target architecture
 
 ```mermaid
 flowchart TB
-    subgraph Startup["REGISTRY_MODE=startup"]
-        S["startup entry\nwait engine ready"]
-    end
-
-    subgraph Hook["REGISTRY_MODE=hook"]
-        C["RI controller"]
-        R[("RoleInstance\nhook-state + markers")]
-        L["lifecycle\nRI watcher / hook task / marker client"]
-    end
-
-    subgraph Shared["Shared traffic modules"]
-        T["runtime\ntraffic state machine"]
-        H["heartbeat\nperiodic register"]
-        A["registration\nSGLang / vLLM adapter"]
-        E["endpoint\naddress resolver"]
-    end
-
-    subgraph Upstream["Router / Proxy"]
-        U["Members"]
-    end
-
-    S --> T
-    C -->|write state + marker| R
-    L -->|watch state + marker| R
-    L -->|remove own marker| R
-    R -->|marker cleared| C
-    L --> T
-    T --> H
-    T --> A
-    H --> A
-    E --> A
-    A --> U
+    C["RBG / orchestration system"] -->|write signalLabel group| R[("RoleInstance labels")]
+    F["event_callbacks configuration"] --> B["Plugin registration and binding resolution"]
+    B --> X["Executor: start / ordered signalLabels / end"]
+    R -->|direct LIST/WATCH| W["RI watcher / signalLabel client"]
+    W -->|latest labels snapshot| X
+    X -->|clear corresponding signalLabel after callback success| W
+    W -->|GET / PATCH| R
+    R -->|completion acknowledgment for each signalLabel| C
+    X --> P["Independent Callback plugins"]
+    P --> T["Shared business dependencies / heartbeat"]
+    T --> A["registration / drain adapters"]
+    E["endpoint resolver"] --> A
+    A --> U["Router / Proxy / Engine"]
 ```
 
-Startup and hook are mutually exclusive entry points: startup directly drives the traffic runtime, while hook drives it through lifecycle markers. They share runtime, heartbeat, registration, and endpoint. `REGISTRY_MODE=none` has no entry point and performs no registration actions.
+Start, hook, and end can be configured together and are all converted into the same execution structure. Hook input is a signal; the current implementation supports only signalLabel, and other signal sources can be added later. Without hook bindings, no Kubernetes watcher is created. Without registration-related callbacks, Patio neither starts heartbeat nor modifies router membership. Plugins may share business dependencies, but they do not share an RBG hook interface.
 
-### 1.3 Directory changes
+### Directory changes
 
 `api/`, `engine/`, and `metrics/` are unrelated to this proposal and remain unchanged.
 
@@ -202,8 +190,11 @@ patio/
 ├── api/
 ├── engine/
 ├── metrics/
-├── lifecycle/
+├── lifecycle/              # RI observation and signalLabel writeback
 ├── runtime/
+│   ├── callback_registry.py
+│   ├── executor.py
+│   ├── callbacks/          # Independent business operations
 │   └── heartbeat/
 ├── registration/
 └── endpoint/
@@ -213,26 +204,28 @@ Migration:
 
 | Current | Target | Change |
 | --- | --- | --- |
-| `topo/client/*` | `registration/` | Retain only SGLang / vLLM membership protocol |
-| Address derivation in `topo/utils.py` | `endpoint/` | Independently derive router / worker / engine endpoints |
-| Heartbeat loop in `app.py` | `runtime/heartbeat/` | Encapsulate startable / stoppable periodic register |
-| Startup and signal orchestration in `app.py` | `runtime/` | Drive startup / hook / none according to `REGISTRY_MODE` |
-| New | `lifecycle/` | Watch RI, match markers, schedule actions, and delete markers |
-| `topo/server/` | Unchanged | Not on the hook executor main path |
+| `topo/client/*` | `registration/` | Retain only the SGLang / vLLM membership registration protocols |
+| Address derivation in `topo/utils.py` | `endpoint/` | Derive router / worker / engine endpoints independently |
+| Heartbeat loop in `app.py` | `runtime/heartbeat/` | Encapsulate periodic register with start / stop |
+| Startup and signal orchestration in `app.py` | `runtime/executor.py` | Execute configured start, hook, and end uniformly without a registration bypass |
+| New | `runtime/callback_registry.py`, `runtime/callbacks/` | Register independent callbacks and share required dependencies during assembly |
+| New | `lifecycle/` | Watch the RI directly and provide the latest snapshot and conditional signalLabel cleanup |
+| `topo/server/` | Unchanged | Unrelated to the Callback Executor main path |
 
-### 1.4 Module boundaries
+### Module boundaries
 
 | Module | Responsibility | Not responsible for |
 | --- | --- | --- |
-| `lifecycle` | Watch RI, match hooks, schedule actions, delete markers | Router protocol, finalizers, authorization |
-| `runtime` | Bring-up / removal state machine, latest hook-state preemption, task retry | Kubernetes API |
-| `registration` | SGLang / vLLM register / unregister protocol | Deciding when to call it |
+| `lifecycle` | Observe the specified RI, read labels, and clear specified signalLabels | RBG hook recognition, business operations, finalizers, election |
+| `runtime/executor` | Schedule start / end, match signalLabels in configuration order, execute serially, and retry | RBG hook classification, router protocol |
+| `runtime/callbacks` | Independent operations such as onboarding, traffic removal and drain, and route cleanup, including their internal safety ordering | Observing the RI, clearing signalLabels, choosing binding locations |
+| `registration` | SGLang / vLLM register / unregister protocols | Deciding when to invoke them |
 | `endpoint` | Derive router / worker / engine addresses | Registration protocol |
 | `heartbeat` | Start / stop encapsulation for periodic register | Lifecycle decisions |
 
-### 1.5 Registration semantics
+### Registration semantics
 
-Registration encapsulates only the membership protocol:
+Registration encapsulates only the membership registration protocol:
 
 ```text
 register
@@ -247,7 +240,7 @@ stable logical identity = worker endpoint
 worker_id = router-internal handle
 ```
 
-Patio does not persist `worker_id`. The SGLang router supports listing workers; `unregister` lists current members, finds members by stable worker endpoint, removes them, and repeats until the list confirms the member no longer exists. A missing member is an idempotent success; if member state cannot be confirmed, fail closed and do not clear the marker. If one endpoint maps to multiple logical members, all matches must be removed.
+Patio does not persist `worker_id`. The SGLang router supports listing workers. `status` is implemented from list-worker results. `unregister` lists current members, finds and removes corresponding members by stable worker endpoint, and repeats until the list confirms that the member no longer exists. A missing member is an idempotent success. If member state cannot be confirmed, fail closed and do not clear the signalLabel. If one endpoint maps to multiple logical members, all matching members must be covered.
 
 vLLM membership identity:
 
@@ -256,11 +249,11 @@ register   -> POST /instances/add
 unregister -> POST /instances/remove
 ```
 
-The vLLM proxy already provides `/instances/remove`. The current Patio implementation treats `unregister` as a no-op and must be updated. If remove fails or its result cannot be confirmed, fail closed and do not clear the marker.
+The vLLM proxy already provides `/instances/remove`. In the current Patio implementation, `unregister` is a no-op; this outdated implementation must be completed. If remove fails or its result cannot be confirmed, fail closed and do not clear the signalLabel.
 
-### 1.6 Endpoint and heartbeat
+### Endpoint and Heartbeat
 
-Endpoint derivation is independent of the registration protocol and derives:
+Endpoint derivation is independent of the registration protocol and derives the following from environment variables and instance information:
 
 ```text
 router / proxy endpoint
@@ -268,24 +261,24 @@ worker endpoint
 engine health endpoint
 ```
 
-Heartbeat is a self-healing periodic register, not a removal controller:
+Heartbeat is a self-healing mechanism that periodically calls register, not an offboarding controller:
 
-1. `start()` periodically calls register;
-2. after `stop()`, no new register is scheduled;
-3. start / stop is idempotent;
-4. `preUpdate`, `preRecover`, and `preDelete` stop heartbeat first;
-5. wait for the last register request to finish before unregistering;
-6. `postReady` starts heartbeat after registration.
+1. After `start()`, register periodically.
+2. After `stop()`, do not schedule new register calls.
+3. Start and stop are idempotent.
+4. `router_offboard` and `router_cleanup` stop heartbeat internally first.
+5. Wait for the last register request to complete before unregistering.
+6. `router_onboard` starts heartbeat after registration completes.
 
-`preRecover` intentionally does not wait for engine drain: Recovery may have been triggered because the engine is dead, so requiring idle engine metrics would deadlock the operation.
+`router_cleanup` does not wait for engine drain and can bind to a pre-recovery signalLabel. `router_offboard` continues waiting for drain after unregistration. The callback defines this difference; the Executor does not choose between them based on an RBG hook.
 
-While heartbeat is running, a failed register can be retried by the next heartbeat; the registration primitive does not need an additional long retry.
+While heartbeat exists, a single failed register can be retried by the next heartbeat. Registration primitives do not need an additional long retry loop.
 
-## 2. RBG and Patio Hook Executor Coordination
+## RBG Invokes Patio Callbacks Through Labels
 
-### 2.1 Kubernetes API protocol
+### Kubernetes API protocol
 
-Patio accesses a fixed resource and does not make the GVR or state key configurable:
+When hook bindings exist, Patio directly accesses the following fixed resource:
 
 ```text
 group:   workloads.x-k8s.io
@@ -295,53 +288,37 @@ plural:  roleinstances
 scope:   Namespaced
 ```
 
-The lifecycle hook-state label is fixed to the KEP-527 normative value:
+Both reads and writes target the RI. Patio does not rely on propagating RI labels to the Pod and then reading Downward API files, avoiding repeated observation of old labels caused by propagation delay.
 
-```text
-rbg.workloads.x-k8s.io/role-instance-hook-state
-```
+The Executor reads only the keys and values of configured signalLabels. It does not depend on `rbg.workloads.x-k8s.io/role-instance-hook-state` or `rbg.workloads.x-k8s.io/role-instance-lifecycle-state`. Missing labels, unknown values, or changes to these labels neither change callback matching nor preempt tasks.
 
-Patio handles only the four states in this proposal:
+### Coordination flow
 
-```text
-PreUpdate
-PreRecover
-PreDelete
-PostReady
-```
-
-`Updating`, `Recovering`, `Terminating`, `Running`, and unknown states do not trigger Patio registration actions. The old RoleInstanceSet state machine label `rbg.workloads.x-k8s.io/role-instance-lifecycle-state` is not part of this protocol.
-
-### 2.2 Coordination flow
-
-When `REGISTRY_MODE=hook`:
-
-1. The RBG controller writes `hook-state` and the marker when entering a hook phase.
-2. Patio watches the specified RoleInstance.
-3. An action is executed only when both `hook-state` and the marker match.
-4. Before an action with side effects, Patio GETs the latest RI and reconfirms state and marker.
-5. Patio performs the register, unregister, route-cleanup, or drain action required by that hook.
-6. On success, Patio deletes only its own marker.
-7. The RBG controller decides whether to continue based on whether the marker still matches.
+1. When RBG / the orchestration system needs to invoke a Patio callback, it writes a signalLabel. Dependent operations must write their respective signalLabels in the same RI update. signalLabel is the current signal implementation.
+2. After completing start callbacks, Patio LISTs the current RI and then WATCHes subsequent changes. Existing signalLabels must also be processed.
+3. The Executor scans the same labels snapshot in `hook_bindings` configuration order, not labels dictionary order.
+4. When a signalLabel matches, GET the latest RI to recheck it before executing the single bound callback.
+5. After callback success, clear its own signalLabel and confirm the cleanup before processing the next entry. On failure, stop subsequent processing for this pass and retry with backoff.
+6. RBG advances its workflow based on completion of all signalLabels it is waiting for. Patio does not determine whether the business workflow is complete.
 
 Protocol boundaries:
 
-- The controller does not call Patio's HTTP API.
-- Patio does not report business results to the controller.
-- If a pre-hook fails, the marker remains and the controller continues waiting.
-- `postReady` is asynchronous and does not block the RI phase from entering `Running` or RI Ready.
-- RBG may configure multiple markers for a hook; Patio handles only one of them.
-- One marker is used by one executor; duplicate assignment is a deployment configuration error.
+- The controller does not call Patio's HTTP API, and Patio does not report structured business results to the controller.
+- One orchestration action may write multiple signalLabels. Each signalLabel key is assigned to only one Executor.
+- A key can have only one value in RI labels at any given time. Operations that reuse the same key with different values must be triggered by orchestration at different times. Dependent signalLabels that must be written in the same update must use different keys.
+- A signalLabel that still matches remains pending. Patio does not invalidate it based on RBG lifecycle state.
+- Configuration order guarantees ordering only for signalLabels visible together to the same Executor. If a later signalLabel appears alone first, earlier entries are skipped because they do not match, and the later entry executes first. There is no cross-Executor global ordering.
 
-"GET and recheck before execution" is not a distributed lock; it only reduces the effect of stale watch events. A state-change window remains between GET and action. That window relies on the controller's state transition contract, marker ownership, action idempotency, and latest hook-state preemption semantics.
+GET rechecks are not distributed locks. Execution semantics depend on unique ownership, orchestration timing, and callback idempotency.
 
-### 2.3 Marker deletion
+### signalLabel deletion
 
-Marker deletion uses an idempotent JSON Merge Patch:
+signalLabel deletion uses an idempotent JSON Merge Patch:
 
 ```json
 {
   "metadata": {
+    "resourceVersion": "<latest-resource-version>",
     "labels": {
       "patio.engine/update-block": null
     }
@@ -349,280 +326,284 @@ Marker deletion uses an idempotent JSON Merge Patch:
 }
 ```
 
-Before deletion, confirm from the latest watch object, local cache, or GET:
+A signalLabel may be cleared only after callback success. Before deletion, GET the latest RI and confirm that the key/value still matches. PATCH deletes only that key, does not overwrite other labels, and carries `metadata.resourceVersion` from that GET as an optimistic concurrency precondition. The resourceVersion placeholder in the request must be replaced with the value from that GET. On conflict, GET again instead of blindly resending the old patch.
 
-```text
-hook-state matches
-marker key/value matches
-```
+Confirm signalLabel removal through a successful PATCH response or a subsequent GET. If the PATCH outcome is unknown, do not execute subsequent callbacks. Read again to confirm, and retry if the signalLabel still matches. If the key has been deleted or its value has changed, do not clear the new value. End the current pass and rescan from the latest snapshot. This means only that the old trigger is no longer pending; it does not prove business success.
 
-If either does not match, do not PATCH. If the marker is already absent, treat it as cleaned or expired. "Read latest object + PATCH" is not a strong concurrency lock; this design accepts the window and assumes one marker is used by one executor.
+If business execution succeeded but writeback has not been confirmed, a restart may replay the callback. The resourceVersion check protects label writes, but provides no business transaction, RI UID fencing, or ABA protection for identical key/value pairs.
 
-### 2.4 `preDelete` responsibility boundary
+### Deletion responsibility boundary
 
-The RBG controller and orchestration system guarantee the `preDelete` deletion sequence:
+The RBG controller and orchestration system guarantee ordering before and after deletion:
 
 1. The RBG controller injects, waits for, and clears the Pod finalizer.
-2. The RBG controller does not delete the business Pod before the marker is cleared.
-3. The deployment system is responsible for executor / sidecar availability and recovery.
-4. Patio only performs traffic removal, drain, and unregister.
-5. Patio does not inject, delete, or validate Pod finalizers and does not guarantee sidecar liveness.
+2. The RBG controller does not actively delete the business Pod before the signalLabel is cleared.
+3. The deployment system is responsible for Callback Executor / sidecar availability and failure recovery.
+4. Patio executes the configured callback bindings. The deployment may bind the pre-deletion traffic-removal signalLabel to `router_offboard`.
+5. Patio does not inject, delete, or validate Pod finalizers, and does not guarantee sidecar liveness.
 
-If the executor is unavailable, the marker remains and the controller continues waiting. Direct external Pod deletion does not trigger preDelete and follows RBG Recovery semantics.
+If the Executor is unavailable, the signalLabel remains and the controller continues waiting. RBG defines the behavior of direct external Pod deletion; Patio does not handle it additionally.
 
-## 3. Environment Variables and Control
+## User Configuration
 
-### 3.1 `REGISTRY_MODE`
+### Event bindings
 
-`REGISTRY_MODE` selects Patio's registration control entry:
+This proposal adds the optional startup argument `--event-config=/etc/patio/events.yaml` to read YAML configuration. The following binding example onboards at startup, reuses the traffic-removal and drain operation for update / delete signalLabels, onboards for the ready signalLabel, and offboards on exit. The deployment defines signalLabel values.
 
-```text
-REGISTRY_MODE=startup | hook | none
+```yaml
+event_callbacks:
+  start:
+    - router_onboard
+  hook:
+    # ready hook: onboard
+    - signalLabel: "patio.com/router=onboard"
+      callback: router_onboard
+    # update / delete hook: reuse traffic removal and drain
+    - signalLabel: "patio.com/router=offboard"
+      callback: router_offboard
+  end:
+    - router_offboard
 ```
 
-Default:
+Rules:
 
-```text
-REGISTRY_MODE=startup
-```
+1. `start` and `end` are ordered lists of callback names executed in order. `hook` is an ordered detection list, and each entry contains only `signalLabel` and a single `callback`.
+2. Do not use `enabled` or named hook keys. An omitted section is equivalent to an empty list. Explicit `event_callbacks: {}` in a file means no event operations are performed.
+3. Callbacks can be reused across locations. Each hook binds only one callback, and multiple operations use different signalLabels.
+4. Before startup, reject unknown fields, unknown plugins, non-list fields, malformed entry types, duplicate YAML keys, invalid signalLabels, and duplicate bindings of the exact same signalLabel (same key and value). Bindings with the same key but different values are allowed to reuse one key at different times. Empty lists are valid; explicit null is not equivalent to an empty list.
+5. Split each signalLabel at the first `=` and validate Kubernetes label syntax. Reject startup for a missing `=`, an empty key, or an invalid key/value. Empty values are allowed by Kubernetes label rules, and matching must distinguish a missing key from an empty string.
+6. Load configuration at startup without hot reload. Reject startup when the file is unreadable, parsing fails, or the format is invalid. Do not silently fall back to startup registration.
+7. Compatibility defaults are used only when `--event-config` is absent. Deployments that would previously run a topo client (with `--instance-info`) are converted to `start: [router_onboard]`, `end: [router_cleanup]`, and `hook: []`. Deployments that would not run a topo client receive empty bindings. Both still use the unified Executor, with no separate mode branch.
+8. Explicit configuration completely replaces these defaults and does not append default callbacks. The Executor designated by RBG must explicitly mount and specify its configuration. Other instances use empty bindings, with no election or lease.
+9. Hook inputs are collectively called signals. The first version implements only signalLabel; other signal sources can be added later without changing callback semantics.
 
-| Mode | Meaning |
-| --- | --- |
-| `startup` | Preserve current behavior: wait for engine readiness on startup, register, and start heartbeat; do not process lifecycle markers |
-| `hook` | This instance is the designated registration hook executor: do not register on startup, do not start heartbeat, and drive register / unregister / recovery route cleanup / drain from markers while clearing only this executor's marker |
-| `none` | Do not register, start heartbeat, or process lifecycle markers |
+### Runtime parameters and injection
 
-`hook` and `startup` are mutually exclusive, preventing a restart after traffic removal from being re-registered by startup logic.
-
-The RBG / orchestration system designates the hook executor by injecting `REGISTRY_MODE=hook`. Patio performs no election, lease, or authorization. Other Pods' Patio instances use `REGISTRY_MODE=none`.
-
-### 3.2 Environment variables
-
-| Variable | Required | Meaning |
+| Argument / variable | Required condition | Meaning |
 | --- | --- | --- |
-| `REGISTRY_MODE` | Optional; default `startup` | Registration control mode |
-| `LIFECYCLE_RI_NAME` | Required when `REGISTRY_MODE=hook` | RoleInstance name to watch |
-| `LIFECYCLE_PRE_UPDATE_MARKER` | At least one marker in hook mode | `preUpdate` trigger marker |
-| `LIFECYCLE_PRE_RECOVER_MARKER` | At least one marker in hook mode | `preRecover` trigger marker |
-| `LIFECYCLE_POST_READY_MARKER` | At least one marker in hook mode | `postReady` trigger marker |
-| `LIFECYCLE_PRE_DELETE_MARKER` | At least one marker in hook mode | `preDelete` trigger marker |
-| `LIFECYCLE_DRAIN_CHECK_INTERVAL` | Optional; default `1s` | Drain snapshot polling interval |
-| `LIFECYCLE_DRAIN_STABLE_SAMPLES` | Optional; default `3` | Number of consecutive successful idle snapshots required before declaring idle |
+| `--event-config` | Must be explicitly provided for RBG deployments using signalLabels | Event-binding YAML path; a new interface introduced by this proposal |
+| `LIFECYCLE_RI_NAME` | Nonempty hook list | Name of the RI to observe |
+| `LIFECYCLE_DRAIN_CHECK_INTERVAL` | Optional; default `1s` | Drain polling interval for `router_offboard`; must be positive |
+| `LIFECYCLE_DRAIN_STABLE_SAMPLES` | Optional; default `3` | Number of consecutive successful idle samples; must be a positive integer |
+| `HEARTBEAT_INTERVAL` | Existing configuration | Heartbeat period |
 
-Marker examples:
+signalLabel is the first signal implementation, and all signalLabels come from YAML hook bindings. Router, worker, and engine parameters continue to use existing endpoint / `--instance-info` configuration. Dependencies of selected callbacks are validated before startup.
 
-```text
-LIFECYCLE_PRE_UPDATE_MARKER=patio.engine/update-block=true
-LIFECYCLE_PRE_RECOVER_MARKER=patio.engine/recover-block=true
-LIFECYCLE_POST_READY_MARKER=patio.engine/ready-block=true
-LIFECYCLE_PRE_DELETE_MARKER=patio.engine/delete-block=true
-```
+When hooks are nonempty, Patio obtains the namespace from the Pod service account and accesses only the RI named by `LIFECYCLE_RI_NAME` in that namespace. Cross-namespace access and member discovery are not supported. Without hook bindings, Kubernetes credentials are not required.
 
-Rules:
+The RBG Role's `lifecycle.labelsHandler` defines the hook-to-signalLabel mapping. Orchestration must keep it consistent with Patio's callback binding configuration, which can be generated and mounted as a file. Patio consumes only signalLabels and is unaware of hook names. Which Executor runs, when each signalLabel is set, and whether dependent signalLabels are written in the same update are all deployment protocol concerns.
 
-1. A marker is a `key=value` string.
-2. Kubernetes label keys and values do not contain `=`; split on the first `=`.
-3. Reject startup when `=` is missing, the key is empty, or the label syntax is invalid.
-4. An unset variable disables that hook for this executor; it does not mean Patio must validate whether RBG configured the hook.
-5. In hook mode, at least one marker must be configured; configuring no markers at all is a Patio configuration error and must reject startup.
-6. Patio observes, handles, and deletes only its own configured markers.
+### Signal behavior
 
-When `REGISTRY_MODE=hook`, `LIFECYCLE_RI_NAME` must be injected. Patio derives the current namespace from the Pod service account and accesses only that RoleInstance in that namespace; it provides no cross-namespace configuration. Patio does not inject or read the RI UID and does not discover members through owner references or labels. Which member runs the executor is controlled by the deployment through `REGISTRY_MODE`.
+Install SIGTERM / SIGINT handling before executing any start callback. After receiving a signal:
 
-This proposal does not handle UID fencing for same-name RI delete/recreate. RBG's preDelete finalizer ensures the old RI completes deletion before a replacement object is created; Patio's register, unregister, and marker cleanup actions must also be idempotent and safely replayable.
+1. Stop accepting new hook work, interrupt retry waits, and cooperatively cancel / settle the current callback. Do not let it run concurrently with end callbacks.
+2. Stop this process's heartbeat and wait for in-flight register calls to settle, then execute end callbacks in configuration order.
+3. End callbacks share one shutdown deadline and run best-effort. After logging a failure, processing may continue to the next entry; exit when the deadline is exhausted. The process shutdown budget provides the deadline, which must be shorter than the Pod's remaining termination grace period and is not restarted for each entry.
+4. Signals are not interpreted as any RBG hook, and interrupted signalLabel invocations are not cleared. End callbacks have no signalLabel writeback authority.
+5. Finally close watchers, clients, and all local background tasks. Even if an end callback starts background tasks, they cannot extend the process shutdown deadline.
 
-The source of marker configuration is `lifecycle.labelsHandler` on the RBG Role. Long term, RBG / orchestration should inject marker environment variables from the effective lifecycle configuration to avoid duplicate configuration; manual injection remains allowed for now. A mismatch with RBG's effective configuration is a deployment error.
+Callbacks must support cancellation and bounded I/O. If the current task cannot settle within the shutdown deadline, do not run end callbacks in parallel; process exit terminates the remaining work. SIGKILL / crashes cannot guarantee end execution. Even if end configures `router_offboard`, it cannot replace the reliable pre-deletion signalLabel workflow.
 
-### 3.3 Signal behavior
+## Execution Logic and Pseudocode
 
-SIGTERM / SIGINT semantics:
+The following code is pseudocode. It expresses execution order and module collaboration only, not final interfaces or implementation.
 
-| Mode | Behavior |
-| --- | --- |
-| `startup` | Stop heartbeat, best-effort unregister, then exit |
-| `hook` | Stop heartbeat and local tasks, then exit directly; do not unregister or clear markers |
-| `none` | Exit directly; perform no registration actions |
+### Callback plugin registration
 
-In hook mode, a signal cannot represent an RBG lifecycle state and must not trigger unregister outside hook control. If a signal interrupts an unfinished pre-hook, the marker remains and recovery is delegated to RBG orchestration.
-
-## 4. Execution Logic and Pseudocode
-
-The code below is pseudocode illustrating ordering and module interaction, not final interfaces.
-
-### 4.1 Startup entry
+Shared registry module `runtime/callback_registry.py`:
 
 ```python
-def run(config):
-    endpoints = endpoint_resolver.resolve()
-    registration_adapter = registration.create(config.protocol, endpoints)
-    heartbeat = Heartbeat(registration_adapter.register)
-    runtime = TrafficRuntime(registration_adapter, heartbeat)
+from collections.abc import Awaitable, Callable
 
-    if config.registry_mode == "startup":
-        runtime.startup()
-    elif config.registry_mode == "hook":
-        lifecycle.run(
-            role_instance_name=config.lifecycle_ri_name,
-            markers=config.lifecycle_markers,
-            runtime=runtime,
+
+EventCallback = Callable[[], Awaitable[None]]
+callback_plugins: dict[str, EventCallback] = {}
+
+
+def register_callback(name: str) -> Callable[[EventCallback], EventCallback]:
+    def decorator(callback: EventCallback) -> EventCallback:
+        if name in callback_plugins:
+            raise ValueError(f"Duplicate Callback plugin registration: {name}")
+        callback_plugins[name] = callback
+        return callback
+
+    return decorator
+```
+
+Independent plugin module `runtime/callbacks/router.py`; only signatures and responsibilities are declared here:
+
+```python
+from ..callback_registry import register_callback
+
+
+@register_callback("router_onboard")
+async def router_onboard() -> None:
+    # Confirm engine readiness, register routes, and start heartbeat.
+    ...
+
+
+@register_callback("router_offboard")
+async def router_offboard() -> None:
+    # Stop heartbeat, settle in-flight registration, unregister, and drain.
+    ...
+
+
+@register_callback("router_cleanup")
+async def router_cleanup() -> None:
+    # Stop heartbeat, settle in-flight registration, and unregister; do not wait for engine drain.
+    ...
+```
+
+Decorators only save function references during module import and do not execute business operations. At application startup, explicitly import trusted plugin modules before validating configuration. Adding a file alone does not discover it. YAML cannot specify arbitrary module paths or use `eval`. The shared registry does not import business plugins in reverse.
+
+When router clients, heartbeat, engine state, or other state must be shared, register callables with bound dependencies during assembly using `register_callback(name)(bound_callback)`. This is an alternative to decorator registration, and the same name must not be registered twice. The registered callable remains a zero-argument asynchronous operation; there is no requirement to implement a unified multi-event handler differentiated by RBG hook. Dependency assembly must complete before the first invocation.
+
+### Configuration to execution structures
+
+The following input has passed structural, plugin-name, and signalLabel validation described in "User Configuration":
+
+```python
+from dataclasses import dataclass
+
+from .callback_registry import EventCallback
+
+
+@dataclass(frozen=True)
+class HookBinding:
+    signal_label: str
+    callback: EventCallback
+
+
+def resolve_callbacks(callback_names, callback_plugins) -> list[EventCallback]:
+    return [callback_plugins[name] for name in callback_names]
+
+
+def build_event_bindings(config, callback_plugins):
+    events = config.get("event_callbacks", {})
+    start_callbacks = resolve_callbacks(events.get("start", []), callback_plugins)
+    end_callbacks = resolve_callbacks(events.get("end", []), callback_plugins)
+    hook_bindings: list[HookBinding] = []
+
+    for hook_config in events.get("hook", []):
+        hook_bindings.append(
+            HookBinding(
+                signal_label=hook_config["signalLabel"],
+                callback=callback_plugins[hook_config["callback"]],
+            )
         )
-    elif config.registry_mode == "none":
-        return
+
+    return start_callbacks, end_callbacks, hook_bindings
 ```
 
-Startup mode:
+All three lists preserve configuration order. Registration does not invoke callbacks, create handlers, or enumerate RBG hooks.
+
+The YAML field name is `signalLabel`; the internal Python field uses `signal_label`.
+
+### Executor flow and recovery
+
+```mermaid
+flowchart TD
+    A["Start, register plugins, validate configuration"] --> B["Run start callbacks in order"]
+    B -->|success| C{"Any hook bindings?"}
+    B -->|failure| H["Settle current task, stop heartbeat"]
+    C -->|no| W["Wait for shutdown"]
+    C -->|yes| L["LIST/WATCH RI labels"]
+    L --> D["Scan current snapshot from the first binding"]
+    D --> E{"Current signalLabel matches?"}
+    E -->|no| N{"More bindings?"}
+    E -->|yes| F["GET to recheck, then await callback"]
+    F -->|success| G["Clear and confirm own signalLabel"]
+    G -->|success| N
+    F -->|failure| R["Stop pass; back off and GET a fresh snapshot"]
+    G -->|failure| R
+    F -->|recheck mismatch| M["GET a fresh snapshot"]
+    G -->|withdrawn or changed| M
+    M --> D
+    R --> D
+    N -->|yes| J["Next binding in the same snapshot"]
+    J --> E
+    N -->|no| L
+    L -. SIGTERM / SIGINT .-> H
+    W -. SIGTERM / SIGINT .-> H
+    H --> I["Run end callbacks in order; exit within deadline"]
+```
+
+The signal entry points in the diagram apply throughout the lifecycle, including while start is waiting. The HTTP API can serve independently. signalLabel callbacks do not execute before start completes.
+
+The following illustrates one ordered pass. The `ri_client` confirmation method follows "signalLabel deletion": return `True` for confirmed cleanup, return `False` when withdrawal / a changed value requires a rescan, and raise an exception on call failure:
 
 ```python
-async def startup(self):
-    await self.engine.wait_ready()
-    await self.registration.register()
-    self.heartbeat.start()
+async def process_snapshot(snapshot, hook_bindings, ri_client):
+    for binding in hook_bindings:
+        if not snapshot.matches(binding.signal_label):
+            continue
+
+        latest = await ri_client.get()
+        if not latest.matches(binding.signal_label):
+            return
+
+        await binding.callback()
+        if not await ri_client.clear_and_confirm(binding.signal_label):
+            return
 ```
 
-Hook mode does not register or start heartbeat on startup; it only waits for RI events.
+Execution rules:
 
-### 4.2 RI event dispatch
+1. Execute start in order. Failure aborts startup, prevents subsequent start or hook execution, and enters bounded shutdown cleanup. A restart may replay start, so callbacks must be idempotent.
+2. Each Executor has only one callback execution lane. The watcher may continue collecting the latest snapshot, but must not start a parallel callback for each event. Events caused by its own PATCH must not cause duplicate concurrent execution either.
+3. A pass detects only signalLabels in that pass's snapshot. signalLabels added during scanning are deferred to the next pass, which starts from the beginning of the configuration. Do not splice a later entry from a new snapshot into a pass that has already skipped its prerequisite.
+4. On callback or cleanup failure, stop the current pass. GET again with bounded backoff and scan from the beginning of the configuration. A retry timer must wake the Executor even without new watch events. Cleared entries are skipped; a failed entry that still matches is retried, and later entries are not processed by bypassing it.
+5. If GET revalidation mismatches or cleanup finds that the signalLabel was withdrawn / changed, end the current pass and rescan using the latest snapshot. Do not clear replacement values or treat withdrawal as business success. External side effects that already occurred cannot be rolled back.
+6. Re-LIST/GET after watch disconnection or resourceVersion expiry. If the RI does not exist, do not execute or clear signalLabels based on stale local events.
+7. After restart, do not rely on local completion records; read only the RI. An operation whose business execution succeeded but whose signalLabel was not cleared may execute again. A missing signalLabel does not mean a business phase completed and must not automatically start heartbeat.
+8. When RBG controls onboarding and start is empty, a process restart does not automatically restore the heartbeat associated with an already-cleared onboarding signalLabel. After confirming that onboarding is allowed, the deployment must trigger the onboarding signalLabel again or define a separate durable recovery protocol. Do not infer recovery from hooks or implicitly start registration compensation.
+9. Changes to RBG lifecycle labels do not preempt the current task. Orchestration guarantees signalLabel grouping and timing. Persistent failure blocks subsequent matching entries in the list; this is the cost of a single fail-closed lane.
 
-```python
-async def run(role_instance_name, markers, runtime):
-    async for event in watch_role_instance(role_instance_name):
-        runtime.cancel_hook_if_state_changed(event.state)
+### Built-in callback contracts
 
-        if event.state == "PostReady" and event.matches(markers.post_ready):
-            await handle_post_ready(event, runtime, markers.post_ready)
+| Callback | Mandatory internal order | Typical signals, not restrictions |
+| --- | --- | --- |
+| `router_onboard` | Confirm engine ready → register successfully → start heartbeat | start or an onboarding signalLabel |
+| `router_offboard` | Stop heartbeat → settle in-flight register → unregister / confirm absence → wait for stable idle | offboarding / pre-deletion signalLabel, or end |
+| `router_cleanup` | Stop heartbeat → settle in-flight register → unregister / confirm absence; no engine drain | pre-recovery signalLabel, or end |
 
-        elif event.state in ("PreUpdate", "PreRecover", "PreDelete"):
-            if event.state == "PreUpdate" and event.matches(markers.pre_update):
-                await handle_pre_hook(event, runtime, markers.pre_update)
-            elif event.state == "PreRecover" and event.matches(markers.pre_recover):
-                await handle_pre_recover(event, runtime, markers.pre_recover)
-            elif event.state == "PreDelete" and event.matches(markers.pre_delete):
-                await handle_pre_hook(event, runtime, markers.pre_delete)
+Mandatory safety steps cannot be delegated to users for split ordering. For example, `router_offboard` internally guarantees that heartbeat stops before unregistration, and heartbeat remains stopped during failure retries. An unknown unregistration result must raise an error rather than return success. Canceling only the local register coroutine does not prove that the remote request had no effect. The adapter must settle in-flight registration before confirming member removal.
+
+`router_cleanup` does not depend on engine metrics. If the engine is dead or drain is `unknown` / `unsupported`, it succeeds as long as member removal is confirmed. `router_offboard`, which requires drain, continues to fail closed.
+
+These callbacks receive no signalLabel, read no RI lifecycle state, and perform no PATCH themselves. After successful return, the Executor clears the signalLabel. Start / end have no signalLabel completion acknowledgment.
+
+### Cross-feature ordering: routing and KVCache
+
+Assume that `kv_cache_dump` and `kv_cache_restore` are registered in the future. This example demonstrates configuration expressiveness only and is not part of the initial business implementation:
+
+```yaml
+event_callbacks:
+  hook:
+    # Restore KVCache and register the worker with the router
+    - signalLabel: "patio.com/kv-cache=restore"
+      callback: kv_cache_restore
+    - signalLabel: "patio.com/router=onboard"
+      callback: router_onboard
+
+    # Unregister the worker from the router and save KVCache
+    - signalLabel: "patio.com/router=offboard"
+      callback: router_offboard
+    - signalLabel: "patio.com/kv-cache=dump"
+      callback: kv_cache_dump
 ```
 
-Both `hook-state` and marker must match. An old marker alone cannot trigger an action.
+- Before offboarding: orchestration writes `patio.com/router=offboard` and `patio.com/kv-cache=dump` in the same update. Remove traffic and drain, then clear the former; save KVCache, then clear the latter.
+- Before onboarding: write `patio.com/kv-cache=restore` and `patio.com/router=onboard` in the same update. Restore and clear the former, then onboard and clear the latter.
+- Each operation has its own signalLabel, and nonmatching entries are skipped. Any operation or cleanup failure prevents subsequent entries. After restart, continue from signalLabels that still exist.
+- The same Executor must process the entries, and dependent signalLabels must use different keys and be set in the same update. If a later signalLabel appears alone earlier, the configuration list is not a dependency barrier.
 
-Patio uses "latest hook-state wins" preemption. After observing a new hook-state, the old local hook task stops advancing: it does not clean the old marker; in-flight register / unregister requests are canceled or allowed to finish at the primitive level, but later steps are not executed. The new state and marker then schedule the new action. Patio does not override controller state with local priority rules. The controller is responsible for valid state transitions and when new states are written; invalid transitions are controller / configuration problems, not Patio decisions.
+There is no need to change `callback` into a list. The Executor knows only detection order, not which RBG hook a signalLabel belongs to.
 
-### 4.3 `postReady` bring-up
+### Drain snapshot
 
-Trigger:
-
-```text
-hook-state=PostReady
-postReady marker matches
-```
-
-```python
-async def handle_post_ready(event, runtime, marker):
-    await runtime.register()
-    runtime.heartbeat.start()
-    runtime.set_serving()
-    await marker.clear_if_still_matching(event)
-```
-
-Rules:
-
-1. Confirm engine readiness; RBG workload Ready is the controller's view, while Patio still uses local engine health before registration.
-2. Complete registration.
-3. Start heartbeat.
-4. Enter serving.
-5. Clear the executor's own marker.
-6. On failure, keep the marker and retry with bounded backoff.
-
-`postReady` does not block the controller from setting phase to `Running`. Whether business traffic recovers is determined by router / proxy state.
-
-### 4.4 `preUpdate` / `preDelete` traffic removal and drain
-
-Trigger:
-
-```text
-hook-state=PreUpdate / PreDelete
-corresponding marker matches
-```
-
-```python
-async def handle_pre_hook(event, runtime, marker):
-    runtime.begin_drain()
-
-    await runtime.heartbeat.stop(wait_inflight=True)
-    await runtime.unregister()
-    await runtime.wait_until_drained()
-
-    await marker.clear_if_still_matching(event)
-```
-
-Execution order:
-
-```text
-preUpdate / preDelete marker
-  -> heartbeat.stop()
-  -> wait for last register
-  -> unregister
-  -> wait for drain
-  -> clear own marker
-```
-
-If any step fails or returns `unknown`, keep the marker, record the failed phase, and replay the idempotent action with bounded backoff; failed steps cannot be skipped. Heartbeat must not start during backoff, and a pre-hook cannot be cleaned as successful.
-
-All hook actions must be idempotent, replayable, and cancellable. After an old task is interrupted:
-
-1. Do not clean an old marker that no longer matches the current state.
-2. Register / unregister side effects already produced are converged by the action for the new state or later replay.
-3. A marker may be cleaned only when the current `hook-state` and marker still match.
-4. The controller is responsible for valid state transition ordering, preventing normal postReady from being abnormally preempted by a pre-hook.
-
-High-level success conditions:
-
-1. The router / proxy member is removed, or confirmed never to have existed.
-2. No new register / heartbeat is scheduled after unregister.
-3. The inference framework adapter reports drain state `idle`.
-4. `idle` remains stable for the configured window.
-5. Business-custom drain checks are not executed in the first version; additional business constraints require a future extension.
-6. State and marker still match immediately before marker deletion.
-
-### 4.5 `preRecover` route cleanup
-
-Trigger:
-
-```text
-hook-state=PreRecover
-preRecover marker matches
-```
-
-```python
-async def handle_pre_recover(event, runtime, marker):
-    runtime.begin_recover_cleanup()
-
-    await runtime.heartbeat.stop(wait_inflight=True)
-    await runtime.unregister_or_confirm_absent()
-
-    await marker.clear_if_still_matching(event)
-```
-
-Execution order:
-
-```text
-preRecover marker
-  -> heartbeat.stop()
-  -> wait for last register
-  -> unregister or confirm member absent
-  -> clear own marker
-```
-
-`preRecover` does not call `wait_until_drained()`. Recovery may be triggered because the engine is dead; an unreachable `/metrics` endpoint, missing engine metrics, or an `unknown` / `unsupported` drain snapshot is not a reason to retain the marker after router membership has been removed or confirmed absent.
-
-Success requires all of the following:
-
-1. Heartbeat is stopped and the last in-flight register has completed or been canceled without scheduling a new registration.
-2. The router / proxy member is removed, or confirmed never to have existed.
-3. The current `hook-state` and marker still match immediately before marker deletion.
-
-If heartbeat stop or router removal cannot be confirmed, keep the marker and retry the idempotent action with bounded backoff. After Patio clears the marker, RBG performs the actual Recovery; after the recovered workload reaches Ready, the same `postReady` path registers the worker and starts heartbeat.
-
-### 4.6 Drain snapshot
-
-The runtime defines common drain semantics; each inference framework adapter interprets what is active, queued, or drained.
+The runtime defines only common drain semantics. Each inference framework's adapter interprets what "active / queued / drained" means.
 
 ```text
 state: idle | draining | unknown | unsupported
@@ -634,13 +615,13 @@ source: sglang-metrics | vllm-metrics | engine-api
 
 Rules:
 
-1. `unknown` and `unsupported` cannot be considered idle.
-2. If `/metrics` is reachable but a required metric is absent, return `unsupported`; for network failure, timeout, 5xx, parse failure, or NaN, return `unknown`.
-3. If a framework cannot provide drain state, the pre-hook fails closed.
-4. Idle requires active / queued / swapped to remain zero for `LIFECYCLE_DRAIN_STABLE_SAMPLES` consecutive snapshots.
-5. Fetch failure, parse failure, or `unknown` resets the stable sample count.
-6. This proposal provides no automatic timeout or automatic release; persistent failure keeps the marker and requires explicit operator handling.
-7. Business-custom drain checks are unsupported in the first version; if metric semantics cannot express the business constraint, define an extension in a separate proposal.
+1. `unknown` and `unsupported` cannot be treated as idle.
+2. If `/metrics` is reachable but a required metric is absent, return `unsupported`. For network failure, timeout, 5xx, parse failure, or NaN, return `unknown`.
+3. If a framework cannot provide drain state, `router_offboard` fails closed; `router_cleanup` does not use this check.
+4. Determining idle requires all applicable active / queued / swapped values to remain zero for `LIFECYCLE_DRAIN_STABLE_SAMPLES` consecutive samples.
+5. Any non-idle sample, including `unknown` / `unsupported`, and any scrape or parse failure resets the stable sample count.
+6. The signalLabel path provides no automatic release after timeout. On persistent failure, the signalLabel remains for operator handling. When the same callback is used for end, it is constrained by the shutdown deadline and produces no signalLabel completion acknowledgment.
+7. The initial built-in plugins do not support business-custom drain checks. Additional business constraints require a separately defined plugin contract; do not claim that default metrics already cover them.
 
 SGLang initial mapping:
 
@@ -649,7 +630,7 @@ sglang:num_running_reqs -> active_requests
 sglang:num_queue_reqs   -> queued_requests
 ```
 
-Report `idle` when both remain zero.
+Report `idle` when both remain zero for `LIFECYCLE_DRAIN_STABLE_SAMPLES` consecutive samples.
 
 The default vLLM drain snapshot must include three current-state gauges:
 
@@ -667,218 +648,207 @@ and queued_requests == 0
 and swapped_requests == 0
 ```
 
-`vllm:num_requests_swapped` represents requests swapped to CPU but not yet finished; checking only running / waiting can incorrectly report idle while swapped requests exist. `vllm:num_preemptions_total` is a cumulative counter, not current state, and cannot participate in drain.
+`vllm:num_requests_swapped` represents requests swapped out to CPU but not yet completed. Checking only running / waiting can incorrectly report idle while swapped requests exist. `vllm:num_preemptions_total` is a cumulative counter, not current state, and cannot participate in drain determination.
 
-Missing metrics are classified as:
+Classify missing metrics as follows:
 
-1. `/metrics` reachable but a required metric absent: `unsupported`.
-2. Network failure, timeout, 5xx, parse failure, or NaN: `unknown`.
-3. Neither `unsupported` nor `unknown` may be treated as idle; keep the marker.
+1. `/metrics` is reachable but a required metric is absent: return `unsupported`.
+2. Network failure, timeout, 5xx, parse failure, or NaN: return `unknown`.
+3. Neither `unsupported` nor `unknown` can be treated as idle; retain the signalLabel.
 
-vLLM metrics can cover streaming requests still generating, but cannot cover HTTP / SSE / WebSocket long connections that remain open after generation, router / proxy internal buffers, or external business transactions. If a business requires all external connections to close before deletion, it must use a business-custom drain check.
+vLLM metrics can cover streaming requests that are still generating, but cannot cover HTTP / SSE / WebSocket long-lived connections that remain open after generation has finished, router / proxy internal buffers, or external business transactions. If the business requires all external connections to close before deletion, it must use a business-custom drain check.
 
-## 5. Responsibility Boundaries and Limitations
+## Responsibility Boundaries and Limitations
 
-### RBG / orchestration system is responsible for
+### RBG / orchestration system responsibilities
 
-- Designating which Pod / sidecar is the hook executor;
-- Injecting `REGISTRY_MODE`, the RI name, and marker environment variables;
-- Managing RoleInstance lifecycle state and marker writes;
-- Managing Pod finalizers and deletion ordering;
-- Ensuring the executor remains available while preRecover and preDelete markers must be processed;
-- Handling controller / executor failure recovery.
+- Designate which Pod / sidecar is the Callback Executor.
+- Inject the event configuration file, RI name, and dependencies required by callbacks.
+- Manage the RoleInstance lifecycle, hook-to-signalLabel mapping, signalLabel grouping, and write timing; write dependent signalLabels in the same update.
+- Manage Pod finalizers and deletion ordering.
+- Ensure the Executor is available when the relevant signalLabels must be processed.
+- Handle controller / Executor failure recovery.
 
-### Patio is responsible for
+### Patio responsibilities
 
-- Watching the specified RoleInstance;
-- Matching state and marker;
-- Calling register / unregister;
-- Controlling heartbeat start / stop;
-- Performing preRecover route cleanup without engine drain;
-- Performing preUpdate / preDelete drain checks;
-- Clearing its own marker.
+- Watch the specified RoleInstance.
+- Register independent callbacks, validate configuration, and run start / end.
+- Match only signalLabels and execute serially in configuration order.
+- Let business callbacks control register / unregister, heartbeat, and drain.
+- Clear each callback's own signalLabel after success; on failure, stop subsequent processing and retry.
+- Do not infer RBG hooks, business workflow completion, or priority between old and new operations.
 
 ### Current limitations
 
-1. Multi-Pod RI member discovery and action invocation require an RBG definition. This proposal defines only one Pod / one executor semantics and no member discovery.
-2. The first version does not implement business-custom drain checks for `preUpdate` / `preDelete`. Default engine metrics cannot cover idle HTTP / SSE / WebSocket long connections, router / proxy internal buffers, or external business transactions; these constraints require a separate extension proposal. `preRecover` intentionally does not use engine drain metrics.
-3. The first version does not use RI UID fencing; it relies on RBG's preDelete finalizer and Patio action idempotency for same-name delete/recreate.
+1. RBG must define member discovery and action invocation protocols for multi-Pod RIs. This proposal defines only single-Pod / single-Executor semantics and does not perform member discovery.
+2. The initial plugins do not implement business-custom drain checks or KVCache operations. Default metrics cannot cover long-lived connections after generation finishes, router buffers, or external transactions. `router_cleanup` intentionally does not check engine drain.
+3. The first version provides neither RI UID fencing nor a durable execution log. For same-name RI recreation, orchestration must ensure the old Executor has settled. Finalizers and idempotency do not provide isolation across object generations.
+4. A missing signalLabel cannot restore in-process heartbeat state. After an Executor restart following onboarding, orchestration must explicitly retrigger onboarding.
+5. Configuration cannot validate business intent. Binding `router_onboard` to an offboarding signalLabel is structurally valid. Users are responsible for hook-to-signalLabel mapping, ordering, and start / end selection.
 
 ## Compatibility
 
-1. `REGISTRY_MODE` defaults to `startup`; deployments that do not explicitly enable hook mode retain registration, heartbeat, and signal behavior.
-2. The `topo` refactor is internal; `TOPO_TYPE`, `--instance-info`, router endpoint derivation, and the existing registration protocol remain compatible in startup mode.
-3. Hook mode requires an RBG controller implementing KEP-527's Role-level lifecycle protocol, `role-instance-hook-state`, and marker writes. Patio is incompatible with deployments that only implement the old RIS `PreparingUpdate` / `PreparingDelete` state machine.
-4. The SGLang router must provide worker listing and identify/delete members by stable worker endpoint; the vLLM proxy must provide `/instances/remove`. If a deployed version lacks these capabilities, the pre-hook fails closed rather than ignoring unregister. This applies to `preRecover` route cleanup as well, even though it does not require engine metrics.
-5. Version skew requires upgrading Patio / router / proxy capabilities before deploying RBG hook configuration and `REGISTRY_MODE=hook`. RBG and Patio must agree on state key, state values, and marker matching semantics.
-6. During downgrade or rollback, an instance with a matching marker cannot simply be switched back to `startup`. Stop new RBG operations, wait for or explicitly handle unfinished hooks, confirm no residual `hook-state` / marker, then remove hook configuration or roll back Patio.
-7. New metrics and logs are additive; existing metric names are not guaranteed unchanged. Removal or renaming will be documented separately.
-8. vLLM deployments must expose running / waiting / swapped current-state gauges; missing metrics return `unsupported` and the pre-hook fails closed.
-9. The first version does not support business-custom drain checks, generic script execution, or arbitrary HTTP check entry points.
+1. Without an event file, generate compatibility default bindings as described in "Event bindings". Preserve startup waiting, registration, heartbeat, and shutdown cleanup for deployments that previously enabled the topo client. The historical vLLM unregister no-op is not a compatibility guarantee.
+2. Explicit event configuration is a complete replacement and appends no implicit registration actions. Empty start does not onboard, empty hook does not access Kubernetes, and empty end does not modify membership.
+3. Preserve `TOPO_TYPE`, `--instance-info`, endpoint derivation, and business APIs. The new event file determines only when operations are invoked. Old-draft mode ENVs and hook-named signalLabel ENVs must be migrated and cannot be mixed with the new configuration.
+4. RBG must correctly implement signalLabel writing, waiting, and completion semantics. Patio does not require a key/value ABI for lifecycle labels. As long as the resource and signalLabel protocol remain unchanged and the callback already exists, RBG can add a hook by adjusting configuration only.
+5. SGLang must support listing workers and removal by endpoint; vLLM must support `/instances/remove`. If unregistration cannot be confirmed, both `router_cleanup` and `router_offboard` fail; errors cannot be ignored to allow progress.
+6. When vLLM drain is required, running / waiting / swapped gauges must be provided; missing gauges return `unsupported`. This requirement does not apply to `router_cleanup`, which performs no drain.
+7. Upgrade Patio and router / proxy before deploying signalLabel bindings. Before rollback, stop new orchestration operations and resolve all unfinished signalLabels. Do not directly switch to startup-onboarding configuration or remove the event file.
+8. Adding plugins does not imply support for arbitrary scripts or HTTP check entry points. New metrics and logs are additive capabilities; changes to existing metrics require separate migration guidance.
 
 ## Observability
 
-Logs must record configuration parsing, watch establish / disconnect / reconnect, hook triggers, register / unregister results, recovery route cleanup, drain snapshots, marker cleanup results, and failure reasons. Logs must not output service account tokens or other sensitive configuration.
+Logs record effective callback order, RI and resourceVersion, signalLabel key, callback name, execution entry point (start / hook / end), retries and failure positions, watch reconnections, registration / drain, and cleanup confirmation results. Do not output service account tokens or other sensitive configuration.
 
-Proposed metrics:
+Proposed new metrics:
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `patio_lifecycle_event_total` | Counter | `state`, `matched` | RI events received and whether state / marker matched |
-| `patio_lifecycle_action_total` | Counter | `hook`, `result` | Hook action success, failure, and cancellation counts |
-| `patio_lifecycle_action_duration_seconds` | Histogram | `hook`, `phase` | Duration of register, unregister, recovery route cleanup, drain, and marker clearing |
-| `patio_registration_state` | Gauge | `engine`, `protocol` | Current local traffic state: unregistered, registering, serving, draining, recover-cleanup, unregister unconfirmed |
+| `patio_lifecycle_event_total` | Counter | `matched` | Number of RI events received and whether any signalLabel matched |
+| `patio_lifecycle_action_total` | Counter | `event`, `callback`, `result` | Success, failure, and cancellation counts for start / hook / end callbacks |
+| `patio_lifecycle_action_duration_seconds` | Histogram | `event`, `callback`, `step` | Duration of callback execution and signalLabel cleanup |
+| `patio_registration_state` | Gauge | `engine`, `protocol` | Current local traffic state: `unregistered`, `registering`, `serving`, `draining`, `recover_cleanup`, `unregistered_confirmed`. `draining` means the registration side is offboarding; see `patio_drain_state` for fine-grained drain state |
 | `patio_drain_state` | Gauge | `engine`, `source` | Adapter-reported idle / draining / unknown / unsupported |
-| `patio_lifecycle_watch_errors_total` | Counter | `operation`, `reason` | Watch / patch / get failures |
+| `patio_lifecycle_watch_errors_total` | Counter | `operation`, `reason` | Number of watch / patch / get failures |
 
-Metric labels exclude the RoleInstance name to avoid high cardinality at scale; single-process diagnostics can correlate through logs.
+Metrics are not classified by RBG hook. Labels do not include RI names, signalLabel keys/values, or resourceVersions. Callback labels use only trusted registered names. Correlate instance-level diagnostics through logs.
 
-Patio HTTP health / readiness must not automatically fail while a hook is processing. Patio Ready means the process and API are available, not that business registration or drain is complete; external traffic admission is controlled by RBG, the router / proxy, and the deployment.
+Patio's HTTP health / readiness does not automatically fail while a hook is being processed. Patio Ready means only that the process and API are available, not that business registration or drain is complete. External traffic admission is controlled by RBG, the router / proxy, and the deployment.
 
 Troubleshooting:
 
-1. A pre-hook marker remains for a long time: check whether Patio is running in `REGISTRY_MODE=hook`, whether watch is healthy, action failure logs, router / proxy reachability. For `preUpdate` / `preDelete`, also check whether drain is `unknown` / `unsupported`; for `preRecover`, engine metrics are not part of the success condition.
-2. A `postReady` marker remains for a long time: check engine readiness, register failures, and heartbeat state; it does not mean the controller is blocked.
-3. An instance receives no traffic: check whether Patio received the postReady marker, whether marker configuration matches RBG's effective configuration, router membership, and heartbeat.
-4. The controller does not advance: check whether markers belonging to other executors remain; Patio clears only its own marker.
+1. signalLabel retained for a long time: check effective bindings, whether start completed, watch / RBAC, callback failures, and cleanup errors. Also check earlier failed entries in the configuration list.
+2. Offboarding failure: check drain for `router_offboard`. For `router_cleanup`, check only heartbeat and router unregistration, without relying on engine metrics.
+3. No traffic received: check whether the onboarding signalLabel was issued, whether bindings are correct, engine readiness, registration, and heartbeat. After an Executor restart, heartbeat cannot be automatically restored from signalLabel absence.
+4. Controller not advancing: check all signalLabels it waits for, including signalLabels owned by other Executors. Do not treat manual signalLabel deletion as business success.
 
 ## Security
 
-1. Hook mode must use a dedicated ServiceAccount. Patio derives the namespace from the Pod service account and accesses only that namespace. Minimal RBAC is `get` and `patch` on `roleinstances` in the current namespace; LIST/WATCH also requires `list` and `watch`, preferably scoped with a `metadata.name` field selector.
-2. Native Kubernetes RBAC cannot restrict PATCH to a specific label key. Accept that limitation and use a dedicated ServiceAccount, least privilege, and audit logs; strict field isolation requires admission or a proxy.
-3. Patio uses the in-process service account token and derived namespace, without long-lived plaintext token configuration. RI name and markers are non-sensitive, but marker key / value must be validated as Kubernetes label syntax to prevent invalid patches.
-4. Marker cleanup uses JSON Merge Patch to delete only its configured key and never replaces the whole `metadata.labels` map.
-5. Router / proxy and engine endpoints are inside the cluster trust boundary. Existing HTTP endpoints add no authentication protocol; cross-trust-domain deployments should use network policy, mTLS, or a proxy rather than expanding this proposal's trust model.
-6. Watch, PATCH, and adapter calls must have timeouts and bounded backoff to avoid exhausting threads / coroutines and file descriptors during API failures or slow responses.
+1. With hook bindings, use a dedicated ServiceAccount granting `get`, `list`, `watch`, and `patch` on `roleinstances` in the current namespace. LIST/WATCH uses a `metadata.name` field selector. Without hook bindings, these permissions are not required.
+2. Native Kubernetes RBAC cannot restrict PATCH to modifying only one label key. Accept this limitation and use a dedicated ServiceAccount, least privilege, and audit logs. Strict field isolation requires admission or a proxy layer.
+3. Patio uses the service account token mounted in the Pod and automatically derives the namespace, without introducing long-lived plaintext token configuration. RI names and signalLabels are non-sensitive configuration, but signalLabel keys / values must be validated against Kubernetes label syntax to prevent construction of invalid patches.
+4. signalLabel cleanup uses JSON Merge Patch with a resourceVersion precondition, deleting only the configured key and never replacing `metadata.labels` as a whole.
+5. Router / proxy and engine endpoints belong to the in-cluster trust boundary. Existing HTTP endpoints add no authentication protocol. Cross-trust-domain deployments should be protected by network policy, mTLS, or a proxy layer rather than expanding this proposal's trust model.
+6. Watch, PATCH, and adapter calls must have timeouts and bounded backoff to prevent API failures or slow responses from exhausting threads / coroutines and file descriptors.
+7. Load YAML safely and reject duplicate keys. Resolve only callback names from the trusted registry. The registration mechanism is not a sandbox; adding a Python plugin is a trusted code deployment.
 
 ## Performance and Scalability
 
-1. Each hook executor watches only one specified RoleInstance and uses a field selector or client-side filtering rather than a namespace-wide informer.
-2. Local cache contains only the current RI and internal traffic state; on resourceVersion expiry or watch reconnect, LIST/GET again rather than retaining history.
-3. Heartbeat continues to use `HEARTBEAT_INTERVAL`; lifecycle mode adds no periodic writes.
-4. Drain polling uses a separate interval, minimum sample count, and stable window; request failures count as backoff, not idle samples.
-5. Each process adds one Kubernetes watch connection and modest memory. Metric cardinality is bounded to combinations of state / hook / result / engine / source.
-6. Drain duration depends primarily on business requests and engine metric refresh and is not a Patio performance SLO; benchmarks only verify that hook and watch overhead is negligible.
+1. Each Callback Executor watches only one specified RoleInstance and uses a field selector or client-side filtering to avoid a namespace-wide informer.
+2. The local cache needs only the current RI object and internal traffic state. On resourceVersion expiry or watch reconnection, LIST/GET again without retaining historical objects.
+3. Heartbeat retains `HEARTBEAT_INTERVAL`. Periodic registration runs only when a relevant callback starts heartbeat; signalLabel observation itself adds no periodic writes.
+4. Drain polling uses an independent interval and minimum sample count. The stable window is implicitly determined by `LIFECYCLE_DRAIN_CHECK_INTERVAL` × `LIFECYCLE_DRAIN_STABLE_SAMPLES`. Request failures count toward backoff and are not treated as idle samples.
+5. With hook bindings, each process adds one Kubernetes watch connection and detects N bindings in O(N) per pass. Metric cardinality is bounded by combinations of registered callback / event / result / engine / source values.
+6. Drain duration depends primarily on business requests and engine metric refresh and is not a performance SLO that Patio can promise. Benchmarks only confirm that hook and watch overhead is negligible.
 
 ## Risks and Mitigations
 
 | Risk | Impact | Detection | Mitigation |
 | --- | --- | --- | --- |
-| Patio / RBG hook-state ABI mismatch | Hooks never fire; instance cannot come up or drain | Lifecycle event metrics, watch logs | Use `role-instance-hook-state` and KEP-527 values; integration tests pin an RBG test version |
-| Deployed router / proxy lacks required list / remove capability | Pre-hooks remain fail-closed; update / delete blocks | Action failure metrics and logs | Publish a capability matrix; disallow hook mode when versions are insufficient |
-| Marker / state configuration differs from RBG effective configuration | Markers do not match or are incorrectly cleared | matched / action metrics, startup logs | Orchestration injects ENV from `labelsHandler`; validate format at startup and test mismatches |
-| Stale watch event or same-name RI recreation | register / unregister based on an old object | resourceVersion logs, registration state | GET latest and recheck before side effects; rely on preDelete finalizer and idempotency, with no first-version UID fencing |
-| Executor restart during a pre-hook | Action repeats or is interrupted | Action results, process restart logs | Register / unregister must be idempotent; marker remains and is replayed after restart |
-| Executor unavailable during preRecover | Recovery marker cannot be cleared; actual recovery is blocked | Marker age and executor process logs | Orchestration must keep the executor available while preRecover markers must be processed; otherwise do not assign preRecover to Patio or use a separate executor |
-| Missing or unparsable engine metrics | Idle cannot be confirmed; pre-hook waits indefinitely | Drain state metrics | `unknown` / `unsupported` fail closed; logs and metrics aid diagnosis |
-| Long-lived / streaming requests not counted as active | Marker cleared too early and requests interrupted | Business error rate, drain duration distribution | Metrics are only the first-version default; businesses may extend custom checks and must explicitly evaluate long streaming workloads |
-| Executor accidentally configured as `startup` | Restart after drain automatically registers again | Registry state / heartbeat logs | Hook mode must be explicit; deployment docs and configuration validation prevent silent fallback |
+| signalLabel configuration differs from orchestration | Operations are not triggered or execute incorrectly | Effective bindings and matched logs | Generate bindings from effective configuration and perform integration validation |
+| Callback location or order is misconfigured | Business errors such as saving before traffic removal or onboarding before restoration | Configuration review and ordering tests | Provide deployment examples; callbacks guarantee internal safety ordering |
+| Dependent signalLabels are written separately or span Executors | A later operation executes first | RI update logs | Write in the same update to the same Executor; otherwise orchestration must provide additional coordination |
+| Callback / PATCH fails persistently | Subsequent matching entries starve | Logs for failed entries and retained signalLabels | Fail closed, back off, and alert; never skip silently |
+| Stale events, signalLabel reuse, or same-name RI recreation | Repeated / obsolete business side effects | resourceVersion and callback logs | GET rechecks, conditional PATCH, and idempotency; orchestration constrains reuse and settles the old Executor, without claiming UID fencing |
+| Executor restarts after onboarding | Heartbeat is lost | Restart logs and router membership | Orchestration retriggers the signalLabel when onboarding is allowed; do not infer from signalLabel absence |
+| Executor is unavailable when a pre-recovery signal arrives | Recovery workflow blocks | Retained signalLabels and process logs | Ensure Executor availability, or do not assign that signalLabel to this sidecar |
+| Router list / remove or engine drain metrics are missing | Completion cannot be confirmed | Action / drain metrics | Publish a capability matrix and fail closed when confirmation is impossible |
+| Long-lived connections are outside default metric coverage | signalLabel is cleared too early | Business error rate and drain logs | Explicitly evaluate business constraints; define additional plugin contracts separately |
+| Onboarding is accidentally configured in start | Restart after traffic removal registers again | Effective configuration logs | RBG deployments explicitly configure empty start and validate deployment arguments |
+| Configuration path is wrong or the file is missing | Startup is rejected and the instance is unavailable | Startup failure logs | File failures never fall back to startup registration; validate deployment arguments and alert |
 
 ## Drawbacks
 
-1. Patio changes from a startup-registration sidecar into a component that depends on the Kubernetes API and RBG lifecycle, increasing deployment complexity.
-2. The marker protocol has no structured business result; the controller sees only waiting or release, and specific failures require Patio logs and metrics.
-3. Fail-closed pre-hooks can block updates / deletes indefinitely. This is safety-first but requires operations and alerting.
-4. Module separation and adapterization increase code size and are initially heavier than directly modifying `topo_client`.
-5. State key, marker, RBAC, and router API capabilities form a cross-project ABI, making version-skew diagnosis more expensive.
+1. Deployments with signalLabel bindings add Kubernetes API, RBAC, and configuration dependencies, increasing deployment complexity.
+2. signalLabels carry no structured business result or execution ID. The reason for waiting can be located only through logs and metrics.
+3. Serial fail-closed processing blocks subsequent matching entries and may wait indefinitely, requiring operator handling.
+4. Independent plugins improve reuse, but users are responsible for correct hook-to-signalLabel mapping and cross-feature ordering.
+5. The design remains coupled to the RoleInstance resource and signalLabel protocol. Low coupling means only that RBG hooks are not understood, not that the design is unrelated to RBG.
 
 ## Alternatives
 
 ### Keep only startup registration
 
-The change is minimal, but Patio cannot coordinate with `postReady` / `preUpdate` / `preRecover` / `preDelete`, safely clean stale routes during recovery, or safely remove and drain traffic.
+This has the smallest change, but cannot participate in RBG-controlled onboarding, update, recovery, and deletion coordination. It cannot clean stale routes before recovery or safely remove and drain traffic.
 
-### RBG controller calls Patio HTTP directly
+### RBG controller calls Patio HTTP API directly
 
-Control is direct, but the controller must understand business APIs, network reachability, and executor availability, coupling responsibilities. RBG KEP chose marker coordination, and this proposal preserves that boundary.
+Control is direct, but the controller must understand business APIs, network connectivity, and Executor availability, coupling responsibilities. The RBG KEP chooses signalLabel coordination, and this proposal preserves that boundary.
 
-### Force hook mode for all instances
+### Keep registration modes and hook dispatch
 
-The semantics are clear but break existing "register on startup" deployments. Therefore the default remains `startup`, and hook mode is explicitly selected by orchestration.
+Mutually exclusive modes and hook enumeration can constrain fixed workflows, but they limit combinations of start / signalLabel / end and require the runtime to change with RBG hooks. This document uses unified bindings and does not retain these branches. Existing behavior is expressed through default callback lists.
 
-### Implement executor election inside Patio
+### Implement Executor election inside Patio
 
-This could automatically choose an executor, but introduces leases, authorization, and split-brain concerns. This proposal treats executor placement as a deployment / orchestration decision, not a runtime decision.
+This could choose an Executor automatically, but introduces leases, authorization, and split-brain problems. This proposal treats which Executor runs a hook as a deployment / orchestration decision, not a runtime decision.
 
 ## Test Plan
 
 ### Unit tests
 
-1. `REGISTRY_MODE`: default `startup`; reject invalid values; reject hook mode without RI name or markers.
-2. marker `key=value`: split on first `=`; reject empty key, invalid label key / value, duplicate configuration, and empty value.
-3. RI event dispatch: `PreUpdate`, `PreRecover`, `PreDelete`, and `PostReady` must match markers; old marker alone does not trigger; unknown states are ignored; duplicate events trigger only idempotent processing.
-4. Traffic state machine: postReady starts heartbeat after successful register; pre-hook stops heartbeat, waits for inflight register, then unregisters; latest hook-state preemption does not clear the old marker.
-5. `preRecover`: stops heartbeat, unregisters or confirms member absence, and does not invoke engine drain; `unknown` / `unsupported` engine metrics do not retain the marker after router cleanup is confirmed; heartbeat remains stopped on retry.
-6. Heartbeat: start / stop are idempotent; stop schedules no new calls; the last register can be awaited; heartbeat errors do not change drain state.
-7. Marker cleanup: JSON Merge Patch deletes only its own key; no PATCH after state or marker changes; handle missing object, missing marker, and PATCH conflict.
-8. Drain adapter: reachable `/metrics` with missing required metrics returns `unsupported`; network failure, timeout, 5xx, NaN, non-numeric, or parse failure returns `unknown`; neither is idle and both reset the stable count.
-9. vLLM drain: running / waiting zero but swapped greater than zero is not idle; all three zero for the stable sample count is idle.
-10. SGLang drain: running or queue greater than zero is not idle; both zero for the stable sample count is idle.
-11. Signals: SIGTERM / SIGINT behavior in all three modes; hook-mode interruption keeps the marker and does not unregister.
+1. Registration: imports record references only; duplicate names are rejected; new modules require explicit import; dependency-bound and decorator registration cannot duplicate a name.
+2. Configuration: reject unknown fields / plugins, wrong types, duplicate YAML keys, null lists, invalid signalLabels, and duplicate bindings of the exact same signalLabel; allow the same key with different values. Omitted sections and empty lists are valid; distinguish empty label values from missing keys.
+3. Defaults: without an event file, generate default bindings based on whether the topo client was enabled. Explicit empty configuration performs no registration. File read failures and old-draft ENVs do not silently fall back. Nonempty hooks require an RI name.
+4. Mapping: all three lists preserve order, each `HookBinding` has only one callback, and there is no event-name or handler enumeration.
+5. Scheduling: signalLabels visible together execute in configuration order regardless of label dictionary order. Missing entries are skipped. New signalLabels added during execution wait for the next pass. Duplicate events do not execute concurrently.
+6. Failure: callback or cleanup failure prevents subsequent entries. Retry occurs even without new watch events. After restart, cleared entries are skipped and unconfirmed entries may be replayed.
+7. Hook independence: missing, unknown, or changed lifecycle labels do not affect signalLabel matching. Lifecycle changes do not preempt tasks, and onboarding is not inferred from signalLabel absence.
+8. signalLabel cleanup: conditional PATCH only after callback success, preserving other labels. Cover 409, lost responses, GET failure, changed values, deletion, and nonexistent RI.
+9. Business callbacks: onboard checks readiness itself; offboard stops heartbeat, settles in-flight register, unregisters, and drains; cleanup never accesses engine drain; retries do not restart heartbeat.
+10. Drain: all applicable SGLang running / queue and vLLM running / waiting / swapped gauges must remain zero for the required consecutive samples before idle. Missing metrics are unsupported; network / parse / NaN failures are unknown; any non-idle sample resets the count.
+11. Signals: exit is possible while start is waiting. The current callback and end do not run concurrently. End runs in order with a shared deadline and best-effort failures, and does not clear hook signalLabels. Without end, only local resources are settled.
 
 ### Integration tests
 
-1. Use a fake Kubernetes API server for a single-RI watch, covering LIST/WATCH reconnect, resourceVersion expiry, stale events, marker PATCH failure, and object deletion.
-2. Use mocked SGLang router / vLLM proxy to verify idempotent register and unregister, remove failure, lost handles after process restart, and heartbeat recovery after router restart.
-3. Use mocked SGLang router / vLLM proxy and an unreachable engine metrics endpoint to verify the complete `preRecover` cleanup order, including marker release after member absence is confirmed.
-4. Use mocked engine metrics to verify the complete `preUpdate` / `preDelete` order and marker retention after partial register / unregister / drain failure.
-5. Verify that startup-mode behavior is unchanged by the refactor as a compatibility regression.
+1. A fake Kubernetes API covers initial LIST, WATCH reconnection, resourceVersion expiry, stale events, conditional PATCH conflicts, and object deletion.
+2. Mock router / proxy verifies idempotent registration and unregistration, lost handles, remove failures, and heartbeat. An unreachable engine verifies that cleanup can still succeed.
+3. Mock engine metrics verifies complete offboard ordering and retained signalLabels after partial failures.
+4. Test callbacks simulate routing / KVCache: set two signalLabels in the same update, verify item-by-item acknowledgment and failure blocking, without implementing KVCache.
+5. Verify default-binding compatibility, no registration with explicit empty start, no Kubernetes access with empty hook, and effective end configuration on signals.
 
 ### End-to-end tests
 
-Only when mock integration cannot cover Kubernetes and real engine behavior:
+Run only when mock integration cannot cover Kubernetes and real engine behavior:
 
-1. Real RBG controller + Patio + SGLang router create / postReady / recover / update / delete flow.
-2. Real RBG controller + Patio + vLLM proxy `/instances/add` / `/instances/remove` flow.
+1. Real RBG controller + Patio + SGLang router create / ready / recover / update / delete flows.
+2. Real RBG controller + Patio + vLLM proxy `/instances/add` / `/instances/remove` flows.
 3. Executor restart, router restart, transient Kubernetes API unavailability, and transient engine metric unavailability.
-4. Version-skew matrix: new Patio + RBG without lifecycle enabled, new RBG + startup Patio, and both with hook enabled.
+4. Version-skew matrix: default compatibility bindings, RBG signalLabel configuration, and newly added RBG hooks; verify independence from lifecycle labels.
+5. After the onboarding signalLabel is cleared, restart the Executor and have orchestration explicitly retrigger onboarding to restore heartbeat.
 
 ### Failure and adversarial tests
 
-1. Inject invalid ENV, missing RBAC, 403 PATCH, 409 conflict, 5xx watch, timeout, slow router response, and malformed JSON.
-2. Trigger a pre-hook while heartbeat register and unregister run concurrently; verify no post-stop registration.
-3. Present postReady, preUpdate, preRecover, and preDelete markers in sequence; verify latest hook-state preempts the old task.
-4. Change state / marker during drain: old task stops without clearing marker and the new action follows the latest state; same-name RI recreation replays idempotently; multiple executors clear only their own keys.
-5. Verify that `unknown` / `unsupported`, request failure, or metric scrape failure cannot be misclassified as idle.
+1. Inject invalid configuration, missing RBAC, 403 / 409 / 5xx, timeouts, slow routers, and corrupted responses. Verify that signalLabels are not cleared incorrectly and that there is no fallback to startup registration.
+2. Race in-flight heartbeat register against offboarding, and verify that old requests cannot register again after unregistration is confirmed.
+3. Add two dependent signalLabels in the same update midway through a scan, and verify that the next pass starts from the beginning. A counterexample where the later signalLabel appears alone first must show that the local list cannot provide a dependency barrier.
+4. Exercise callback success with lost PATCH responses, restart, signalLabel value changes / withdrawal, and same-name RI recreation. Verify conservative retries and cleanup of only owned keys, and document the boundary of having no UID fencing.
+5. Exercise end timeout, SIGKILL, start waiting for a dead engine, and persistent failures blocking subsequent matching entries. Never falsely report business completion.
 
 ### Benchmarks
 
-This proposal does not promise a business drain-time SLO. At large instance counts, measure single-process watch / drain polling CPU, memory, FD, and network overhead, and compare with startup mode to verify that lifecycle watch overhead is negligible.
+Do not promise a business drain-time SLO. Measure CPU, memory, file descriptor, and network overhead with and without hook bindings, plus scanning and event-coalescing overhead at different binding counts.
 
 ## Rollout
 
-1. Phase 1: complete module separation and adapterization while defaulting to `startup`; all existing tests continue to pass.
-2. Phase 2: release the alpha `REGISTRY_MODE=hook` implementation with RBAC examples, deployment docs, logs, and metrics. The SGLang / vLLM capability matrix must be clear.
-3. Phase 3: have RBG / orchestration inject marker ENV from Role `labelsHandler`, enable in a test cluster, and observe postReady / preRecover / preUpdate / preDelete.
-4. Phase 4: expand after confirming no unfinished markers or states.
-5. Rollback: keep `REGISTRY_MODE=startup` available; with unfinished hooks, stop operations and handle markers before rollback. Manually deleting markers to fake success is not a routine rollback method.
-6. Deprecation: if the RBG marker protocol changes, use the new state / marker ABI rather than silently supporting the same-named old protocol.
+1. Complete module separation, plugin registration, and default bindings. Replace legacy startup / signal bypasses and run compatibility regressions.
+2. Implement event files, the ordered Executor, RI watcher, and conditional cleanup. Add RBAC, the capability matrix, logs, and metrics.
+3. Have orchestration inject explicit start / signalLabel / end configuration. Validate existing RBG hook mappings, multiple-signalLabel ordering, and retriggering after Executor restart at small scale.
+4. Expand after confirming there are no residual signalLabels, ordering errors, or unintended registrations.
+5. Before rollback, stop new operations and resolve unfinished signalLabels. Replace configuration or roll back the version only after confirming that startup registration may be restored. Do not treat manual signalLabel deletion as success.
+6. Migrate explicitly when the signalLabel protocol changes. If RBG only adjusts hook names or hook-to-signalLabel mappings while the signalLabel protocol remains unchanged, no Executor dispatch changes are required.
 
 ## Open Questions
 
-The following design decisions are settled:
+The execution rules of this proposal are settled: Patio defines independent callbacks and RBG invokes them through signalLabels; one signalLabel binds one callback; dependent signalLabels are set in the same update and processed by the same Executor in configuration order; lifecycle labels are not read; start / end are explicitly configured; the RI is observed directly; failures are not bypassed; and end is best-effort only.
 
-1. hook-state key is `rbg.workloads.x-k8s.io/role-instance-hook-state`.
-2. Patio handles `PreUpdate`, `PreRecover`, `PreDelete`, and `PostReady`.
-3. `PreRecover` removes or confirms the absence of router membership without engine drain.
-4. RI UID is not injected or read; first version has no UID fencing.
-5. Patio uses the Pod service account and accesses only the Pod's namespace.
-6. SGLang uses worker listing and endpoint-based idempotent delete; vLLM uses `/instances/remove`.
-7. The latest hook-state always preempts the previous local hook task.
-8. Drain defaults to one-second polling and three consecutive successful idle samples and applies only to `preUpdate` / `preDelete`.
+Registration protocols and default drain parameters remain as defined above. The first version provides no UID fencing, execution generations, cross-Executor dependencies, or durable heartbeat recovery.
 
-There are no blocking design questions. If business-custom drain checks are needed later, submit a separate proposal defining the interface contract, authentication boundary, and failure classification.
-
-## Implementation History
-
-- 2026-11-04: Initial proposal defining `REGISTRY_MODE`, marker coordination, module separation, pre-hook drain order, and common drain snapshots.
-- 2026-11-06: Added User Impact, Compatibility, Observability, Security, Performance, Risks, Drawbacks, Test Plan, and Rollout; corrected that lifecycle state must not reuse the old RoleInstanceSet key and organized open questions.
-- 2026-11-06: Confirmed the KEP-527 key `rbg.workloads.x-k8s.io/role-instance-hook-state`; settled no UID fencing, Pod namespace only, SGLang list-worker / vLLM remove, latest hook-state preemption, and default drain parameters.
-- 2026-11-06: Settled that vLLM drain must check running / waiting / swapped gauges and that business-custom drain checks require a future proposal.
-- 2026-11-09: Added `preRecover` route cleanup: stop heartbeat, unregister or confirm absence, and clear the marker without waiting for engine drain.
+Before rollout, the deployment side must verify whether RBG can set dependent signalLabels in the same update, whether the Executor is available during Recovery, how onboarding is retriggered after restart, and how the process shutdown budget aligns with the Pod grace period. Concrete plugin contracts for KVCache and business-custom drain are outside this proposal.
 
 ## References
 
-1. RBG KEP-527: `rbg/keps/527-roleinstance-lifecycle/README.md`
+1. RBG KEP-527: `rbg/keps/527-roleinstance-lifecycle/README.zh-CN.md`
 2. RBG KEP template: `rbg/keps/NNNN-kep-template/README.md`
 3. This repository's proposal template: `proposals/NNNN-template/README.md`

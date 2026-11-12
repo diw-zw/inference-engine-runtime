@@ -11,11 +11,13 @@ approvers:
 status: draft
 
 creation-date: 2026-11-06
-last-updated: 2026-11-09
+last-updated: 2026-11-10
 
 # Component(s) primarily affected by this change.
 areas:
   - topo
+  - runtime
+  - lifecycle
   - deployment
   - documentation
 
