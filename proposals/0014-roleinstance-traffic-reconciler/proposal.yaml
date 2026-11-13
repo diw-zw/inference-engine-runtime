@@ -1,5 +1,5 @@
-title: Patio as RoleInstance Callback Executor
-proposal-number: 14
+title: Patio as RoleInstance Traffic Reconciler
+proposal-number: "0014"
 authors:
   - diw-zw
 reviewers:
@@ -13,19 +13,21 @@ status: draft
 creation-date: 2026-11-06
 last-updated: 2026-11-13
 
+# The first Patio version expected to contain this behavior, if accepted.
+target-version: TBD
+
 # Component(s) primarily affected by this change.
 areas:
   - application
-  - events
-  - callbacks
   - registration
   - engine
+  - metrics
   - topo
   - deployment
   - documentation
 
 # Related issues and pull requests.
 issues:
-  - https://github.com/rolebasedgroup/inference-engine-runtime/issues/14
+  - https://github.com/rolebasedgroup/inference-engine-runtime/pull/10
 see-also:
-  - https://github.com/sgl-project/rbg/blob/main/keps/527-roleinstance-lifecycle/README.md
+  - https://github.com/sgl-project/rbg/pull/546
