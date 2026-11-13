@@ -6,7 +6,7 @@
 | 日期 | 创建于 2026-11-04；更新于 2026-11-13 |
 | 作者 | inference-engine-runtime maintainers |
 | 参考 | sgl-project/rbg#546（KEP-527 草案） |
-| 范围 | 面向单个 RoleInstance 的单写者流量调和；先支持 SGLang；vLLM 后续跟进 |
+| 范围 | 面向单个 RoleInstance 的单写者流量调和；先支持 SGLang；vLLM 通过 xPyD-proxy v1.7.0+ 支持 |
 
 ## 概述
 
@@ -169,7 +169,16 @@ vLLM V1 只使用 running 和 waiting。`vllm:num_requests_swapped` 不是 V1 �
 
 ### vLLM 状态
 
-v1 不声称支持 vLLM。上游示例 proxy 只文档化了 `/instances/add`，可用的 remove API 尚未确认。在找到具体 proxy 和版本并提供可确认的 `/instances/remove` 之前，选择 vLLM 并启用 RBG reconciliation 属于 unsupported，启动时 fail closed。
+具体 proxy 是 xPyD-proxy v1.7.0 或更高版本，当前为 v1.8.0。
+
+它实现了带鉴权的 `POST /instances/add` 和 `POST /instances/remove`，并且使用与当前 Patio 客户端相同的 `type` + `instance` payload。移除时先把目标标记为 `draining`，等待活跃请求数归零，再从 discovery、健康检查、调度和 instance registry 中移除。超时返回 `504`，实例保持 draining，因此可以安全重试同一个移除请求。
+
+管理端点要求 `X-API-Key` header，值必须匹配 proxy 的 `ADMIN_API_KEY`；vLLM router adapter 必须发送该 header。
+
+补充说明：
+
+- 上游核心 vLLM 的 `examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py` 只文档化了 `/instances/add`；
+- vLLM Ascend v0.30.0 也有 `/instances/remove`，但其 payload 使用 `type` + `instances` 列表，而不是当前 Patio 使用的单数 `instance` 字段。
 
 ### RBG marker 处理
 
@@ -289,16 +298,17 @@ patio/
 4. 验证 Patio 重启后能从当前 RI 和 Pod 状态收敛。
 5. 验证 SGLang PD drain 对 prefill 和 decode 使用正确指标。
 6. 验证 vLLM V1 drain 只使用 running 和 waiting。
-7. 在 remove API 支持前，验证选择 vLLM 并启用 RBG reconciliation 时 fail closed。
+7. 验证 xPyD-proxy v1.7.0+ 的 add/remove、`X-API-Key`、drain-and-retry 和超时行为。
 8. 验证只有 membership 和 quiescence 满足 hook 条件后才清除 marker。
 9. 验证 projected token 在 Patio 和 engine 容器之间隔离。
 
 ## 开放问题
 
 1. sgl-project/rbg#546 合并后的最终 KEP-527 marker ABI。
-2. 提供可确认 remove API 的具体 vLLM proxy 和版本。
 
 ## 参考
 
 1. sgl-project/rbg#546
 2. `proposals/README.md`
+3. xPyD-proxy v1.7.0 release：https://github.com/xPyD-hub/xPyD-proxy/releases/tag/v1.7.0
+4. xPyD-proxy drain-and-remove PR：https://github.com/xPyD-hub/xPyD-proxy/pull/172

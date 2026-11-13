@@ -6,7 +6,7 @@
 | Date | Created 2026-11-04; updated 2026-11-13 |
 | Author | inference-engine-runtime maintainers |
 | Reference | sgl-project/rbg#546 (KEP-527 draft) |
-| Scope | Single-writer traffic reconciliation for one RoleInstance; SGLang first; vLLM follow-up |
+| Scope | Single-writer traffic reconciliation for one RoleInstance; SGLang first; vLLM via xPyD-proxy v1.7.0+ |
 
 ## Summary
 
@@ -169,7 +169,16 @@ For vLLM V1, drain uses running and waiting only. `vllm:num_requests_swapped` is
 
 ### vLLM status
 
-v1 does not claim vLLM support. The upstream example proxy only documents `/instances/add`, and the available remove API is unverified. Until a concrete proxy and version with a confirmable `/instances/remove` are identified, selecting vLLM with RBG reconciliation is unsupported and startup fails closed.
+The concrete proxy is xPyD-proxy v1.7.0 or later, currently v1.8.0.
+
+It implements authenticated `POST /instances/add` and `POST /instances/remove` with the same `type` + `instance` payload used by the current Patio client. Removal marks the target `draining`, waits for active requests to reach zero, then removes it from discovery, health checks, scheduling, and the registry. A timeout returns `504` while leaving the instance draining, so the same removal can be retried.
+
+The admin endpoints require an `X-API-Key` header matching the proxy's `ADMIN_API_KEY`; the vLLM router adapter must send it.
+
+For completeness:
+
+- upstream core vLLM's `examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py` only documents `/instances/add`;
+- vLLM Ascend v0.30.0 also has `/instances/remove`, but its payload uses `type` + `instances` as a list, not the singular `instance` field used by current Patio.
 
 ### RBG marker handling
 
@@ -289,16 +298,17 @@ Proposed metrics:
 4. Verify a Patio restart converges from current RI and Pod state.
 5. Verify SGLang PD drain uses the correct metrics for prefill and decode.
 6. Verify vLLM V1 drain uses running and waiting only.
-7. Verify vLLM selection with RBG reconciliation fails closed until the remove API is supported.
+7. Verify xPyD-proxy v1.7.0+ add/remove, `X-API-Key`, drain-and-retry, and timeout behavior.
 8. Verify marker clearing only after membership and quiescence facts satisfy the hook.
 9. Verify projected token isolation between Patio and engine containers.
 
 ## Open Questions
 
 1. Final KEP-527 marker ABI after sgl-project/rbg#546 merges.
-2. Concrete vLLM proxy and version providing a confirmable remove API.
 
 ## References
 
 1. sgl-project/rbg#546
 2. `proposals/README.md`
+3. xPyD-proxy v1.7.0 release: https://github.com/xPyD-hub/xPyD-proxy/releases/tag/v1.7.0
+4. xPyD-proxy drain-and-remove PR: https://github.com/xPyD-hub/xPyD-proxy/pull/172
