@@ -4,7 +4,6 @@ import argparse
 import json
 import signal
 import sys
-import threading
 import time
 import traceback
 from urllib.parse import urljoin
@@ -13,19 +12,26 @@ from prometheus_client import REGISTRY
 from patio import envs
 from patio.api.server_router import server_router
 from patio.api.lora_router import lora_router
-from patio.config import DEFAULT_PATIO_PORT, EXCLUDE_ENDPOINTS, EXIT_EVENT
+from patio.config import DEFAULT_PATIO_PORT, EXCLUDE_ENDPOINTS
 from patio.logger import configure_logging, init_logger
 
 from patio.metrics.engine_collector import EngineCollector
 from patio.metrics.engine_metric_rules import get_metric_standard_rules
 from patio.metrics.metrics import REQUEST_COUNT, REQUEST_LATENCY, patio_registry
 
-from patio.topo.client.base_topo_client import GroupTopoClient
+from patio.engine.probes.factory import create_engine_probe
+from patio.registration import (
+    EngineCondition,
+    ManualDrainCondition,
+    ProcessCondition,
+    RBGCondition,
+    TrafficReconciler,
+)
+from patio.registration.adapters.factory import create_router_adapter
 
 from fastapi import FastAPI, Request
 import uvicorn
 
-from patio.topo.factory import create_topo_client
 
 app = FastAPI(title="Patio Server", debug=False)
 
@@ -33,7 +39,7 @@ app = FastAPI(title="Patio Server", debug=False)
 app.include_router(server_router)
 app.include_router(lora_router)
 
-topo_client: GroupTopoClient = None
+traffic_reconciler: TrafficReconciler | None = None
 
 
 # Middleware to collect metrics
@@ -70,16 +76,16 @@ def _init_metrics(scrape_metrics: bool):
         patio_registry.register(engine_collector)
 
 
-def stop_topo_client_signal_handler(signal, frame):
-    global topo_client
-    if topo_client is not None:
-        topo_client.unregister()
+def stop_traffic_reconciler_signal_handler(signal, frame):
+    global traffic_reconciler
+    if traffic_reconciler is not None:
+        traffic_reconciler.stop()
     sys.exit(0)
 
 
-def run_topo_client(worker_instance_info: str) -> GroupTopoClient:
+def run_traffic_reconciler(worker_instance_info: str) -> TrafficReconciler:
     logger = init_logger(__name__)
-    logger.info("Starting Patio TopoClient...")
+    logger.info("Starting Patio traffic reconciler...")
     logger.info(f"worker instance info: {worker_instance_info}")
 
     worker_dict = None
@@ -102,39 +108,39 @@ def run_topo_client(worker_instance_info: str) -> GroupTopoClient:
         worker_dict["topo_type"] = topo_type
 
     try:
-        global topo_client
+        global traffic_reconciler
         worker_info = worker_dict["data"]
         if worker_info is None:
             logger.error(
                 f'No worker info found for worker instance info, please set "data" field in instance info'
             )
             sys.exit(1)
-        topo_client = create_topo_client(worker_dict["topo_type"], worker_info)
-        topo_client.wait_engine_ready(worker_info)
-        topo_client.register("", worker_info)
-        signal.signal(signal.SIGTERM, stop_topo_client_signal_handler)
-        signal.signal(signal.SIGINT, stop_topo_client_signal_handler)
-
-        # Start a heartbeat thread to periodically re-register with the router,
-        # ensuring workers automatically recover registration after a router restart.
-        def _heartbeat_loop():
-            interval = int(envs.HEARTBEAT_INTERVAL)
-            while not EXIT_EVENT.wait(timeout=interval):
-                try:
-                    topo_client.register("", worker_info)
-                    logger.debug("heartbeat register ok")
-                except Exception as e:
-                    logger.warning(f"heartbeat register failed: {e}")
-
-        t = threading.Thread(
-            target=_heartbeat_loop, daemon=True, name="patio-heartbeat"
+        router_adapter = create_router_adapter(worker_dict["topo_type"], worker_info)
+        engine_probe = create_engine_probe(worker_info)
+        conditions = {
+            "process": ProcessCondition(),
+            "engine": EngineCondition(engine_probe),
+            "manual_drain": ManualDrainCondition("/etc/patio/annotations"),
+            "rbg": RBGCondition(),
+        }
+        traffic_reconciler = TrafficReconciler(
+            conditions=conditions,
+            router_adapter=router_adapter,
+            engine_probe=engine_probe,
+            engine_name=envs.INFERENCE_ENGINE,
+            interval=float(envs.HEARTBEAT_INTERVAL),
         )
-        t.start()
-        logger.info(f"heartbeat thread started, interval={envs.HEARTBEAT_INTERVAL}s")
+        signal.signal(signal.SIGTERM, stop_traffic_reconciler_signal_handler)
+        signal.signal(signal.SIGINT, stop_traffic_reconciler_signal_handler)
+        traffic_reconciler.start()
+        logger.info(
+            "traffic reconciler started, interval=%ss",
+            envs.HEARTBEAT_INTERVAL,
+        )
 
-        return topo_client
+        return traffic_reconciler
     except Exception as e:
-        logger.error(f"Failed to start Patio TopoClient: {e}")
+        logger.error(f"Failed to start Patio traffic reconciler: {e}")
         sys.exit(1)
 
 
@@ -172,7 +178,7 @@ def main():
     _init_metrics(args.scrape_engine_metrics)
 
     if args.instance_info:
-        run_topo_client(args.instance_info)
+        run_traffic_reconciler(args.instance_info)
 
     # Run the server
     try:

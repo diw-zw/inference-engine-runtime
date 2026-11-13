@@ -10,7 +10,7 @@ Patio is a lightweight FastAPI server that runs alongside inference engine conta
 
 - **LoRA Adapter Management** — Dynamically load and unload LoRA adapters at runtime without restarting the engine
 - **Unified Prometheus Metrics** — Scrape, normalize, and re-expose inference engine metrics with a `patio:` prefix
-- **Distributed Topology Management** — Register workers with a central router, heartbeat-based recovery, and graceful shutdown
+- **Traffic Reconciliation** — Reconcile worker registration from process, engine, drain, and RoleInstance conditions
 - **Health Check & Readiness** — Standard Kubernetes liveness and readiness probes
 
 ## Architecture
@@ -63,15 +63,25 @@ Patio scrapes the inference engine's `/metrics` endpoint and normalizes metric n
 
 Access metrics at `http://localhost:9091/metrics` in Prometheus text format.
 
-### Distributed Topology Management
+### Traffic Reconciliation
 
-For multi-node inference deployments, Patio manages worker registration and discovery:
+For multi-node inference deployments, Patio reconciles router membership from
+independent conditions:
 
-- **Worker Registration** — Automatically registers with a central router on startup
-- **Heartbeat** — Periodic heartbeats ensure automatic recovery if the router restarts
-- **Graceful Shutdown** — Unregisters from the router on SIGTERM/SIGINT
+- **Process** — true until SIGTERM/SIGINT
+- **Engine** — true when the engine is ready
+- **Manual drain** — true unless the Pod drain annotation is enabled
+- **RBG** — true when the RoleInstance allows traffic
 
-Configure via environment variables:
+One reconcile loop is the only writer of router membership. Startup, SIGTERM,
+engine readiness, drain-file changes, and RoleInstance state changes only wake
+the loop.
+
+Manual drain reads the Pod annotation
+`patio.workloads.x-k8s.io/drain` from `/etc/patio/annotations`. The file is
+projected through the Kubernetes downward API.
+
+Configure SGLang via environment variables:
 
 ```yaml
 env:
@@ -83,9 +93,21 @@ env:
     value: "8000"
 ```
 
-For vLLM proxy registration, set `TOPO_TYPE` to `vLLM` and point
-`ROUTER_ROLE_NAME` / `ROUTER_PORT` at the proxy service. Patio registers workers
-with the proxy using `/instances/add`.
+For vLLM, set `TOPO_TYPE` to `vLLM` and configure an xPyD-proxy v1.7.0 or newer
+service:
+
+```yaml
+env:
+  - name: TOPO_TYPE
+    value: "vLLM"
+  - name: VLLM_PROXY_ENDPOINT
+    value: "http://xpyd-proxy:8868"
+  - name: VLLM_PROXY_API_KEY
+    valueFrom:
+      secretKeyRef:
+        name: xpyd-proxy
+        key: admin-api-key
+```
 
 ## Quick Start
 
@@ -146,10 +168,12 @@ python -m patio.app --host 127.0.0.1 --port 9091
 | `TOPO_CONNECT_TIMEOUT` | Connection timeout for topology HTTP requests (seconds) | `3` |
 | `TOPO_HEALTH_CHECK_TIMEOUT` | Read timeout for engine health checks (seconds) | `30` |
 | `TOPO_REGISTER_TIMEOUT` | Read timeout for topology register and unregister requests (seconds) | `10` |
+| `VLLM_PROXY_ENDPOINT` | xPyD-proxy endpoint for vLLM router operations | `None` |
+| `VLLM_PROXY_API_KEY` | xPyD-proxy admin API key | `None` |
 | `GROUP_NAME` | RBG group name | `None` |
 | `ROLE_NAME` | RBG role name | `None` |
 | `ROLE_INDEX` | RBG role index | `None` |
-| `HEARTBEAT_INTERVAL` | Topology heartbeat interval (seconds) | `30` |
+| `HEARTBEAT_INTERVAL` | Traffic reconcile interval (seconds) | `10` |
 
 ## Usage with RoleBasedGroup
 
@@ -253,13 +277,18 @@ inference-engine-runtime/
 │   │   └── protocol.py      # Request/response models
 │   ├── engine/              # Inference engine abstraction
 │   │   ├── base.py          # Base engine interface
+│   │   ├── probes/          # Readiness and drain probes
 │   │   ├── sglang_engine.py # SGLang implementation
 │   │   └── vllm_engine.py   # vLLM implementation
 │   ├── metrics/             # Prometheus metrics
 │   │   ├── metrics.py       # Built-in metrics
 │   │   ├── engine_collector.py # Engine metrics scraper
 │   │   └── standard_rules.py # Metric normalization
-│   └── topo/                # Topology management
+│   ├── registration/        # Traffic reconciliation
+│   │   ├── reconciler.py    # Single-writer reconcile loop
+│   │   ├── conditions.py    # Process, engine, drain, and RBG conditions
+│   │   └── adapters/        # SGLang and xPyD-proxy router adapters
+│   └── topo/                # Legacy topology compatibility
 │       ├── factory.py       # Client/server factories
 │       ├── client/          # Topology clients
 │       └── server/          # Topology servers
