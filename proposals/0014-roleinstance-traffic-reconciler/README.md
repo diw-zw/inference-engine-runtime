@@ -12,6 +12,8 @@
 
 Patio becomes a traffic reconciler for one RoleInstance (RI).
 
+Terminology: Patio calls the trigger it observes a `signal`; RBG encodes that signal on the RoleInstance as a `signalLabel`.
+
 One reconcile loop is the only writer of router membership. Each pass computes whether this worker should be registered, compares that decision with what the router reports, and adds or removes the worker to match. The heartbeat is just the periodic pass. Startup, SIGTERM, hook-state changes, and annotation changes are events that update their own condition and wake the loop; they never write router membership directly.
 
 This removes the need for `REGISTRY_MODE`, the stop-heartbeat-then-unregister ordering, and hook-task preemption. A Patio restart converges from the RI's current state instead of replaying historical events.
@@ -42,7 +44,7 @@ This is suitable for unmanaged startup registration, but not for RBG-controlled 
 2. Make one reconcile loop the only writer of router membership.
 3. Derive desired membership from independent, observable conditions.
 4. Let router adapters and engine probes vary independently.
-5. Confirm removal before clearing RBG markers.
+5. Confirm removal before acknowledging an RBG signal.
 6. Make Patio restart converge from current process, Pod, and RI state.
 
 ## Non-Goals
@@ -111,7 +113,7 @@ The loop publishes two facts:
 | Member | present / absent / unknown | Router membership for this instance identity |
 | Quiescent | yes / no / unknown | Engine has no in-flight or queued work |
 
-RBG marker acknowledgment depends on these facts:
+RBG signal acknowledgment depends on these facts:
 
 | RBG hook | Required facts |
 | --- | --- |
@@ -180,16 +182,16 @@ For completeness:
 - upstream core vLLM's `examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py` only documents `/instances/add`;
 - vLLM Ascend v0.30.0 also has `/instances/remove`, but its payload uses `type` + `instances` as a list, not the singular `instance` field used by current Patio.
 
-### RBG marker handling
+### Signal observation and acknowledgment
 
 Patio watches only the RI named by `LIFECYCLE_RI_NAME`.
 
-Marker key names and state values intentionally track KEP-527. Because sgl-project/rbg#546 is still open, this proposal remains draft and will pin the final ABI after that PR merges.
+Patio uses `signal` as the engine-runtime term for the trigger it observes. RBG encodes that signal as a `signalLabel` on the RoleInstance. The concrete `signalLabel` key and value intentionally track KEP-527; because sgl-project/rbg#546 is still open, this proposal remains draft and will pin the final ABI after that PR merges.
 
-Before clearing a marker:
+Before acknowledging a signal:
 
 1. GET the latest RI.
-2. Confirm the marker key and value still match.
+2. Confirm the signalLabel key and value still match.
 3. PATCH only that key with a JSON Merge Patch.
 4. Use the GET's `resourceVersion` as an optimistic concurrency precondition.
 5. On conflict, GET again and retry.
@@ -225,7 +227,7 @@ Migration from the current code:
 | `topo/client/vllm_topo_client.py` | future `registration/adapters/vllm.py` | Do not enable until remove is verifiable |
 | `topo/factory.py` | adapter selection in `application.py` | Keep `topo/server` unchanged |
 | Engine health waiting in topo clients | `engine/probes` | Separate readiness and quiescence from registration |
-| `app.py` startup and signal handling | `registration/reconciler.py` | Replace direct register/unregister calls with condition updates |
+| `app.py` startup and OS-signal handling | `registration/reconciler.py` | Replace direct register/unregister calls with condition updates |
 | `metrics/engine_metric_rules.py` | unchanged | Consumed by engine probes |
 
 ## Security
@@ -249,10 +251,10 @@ Migration from the current code:
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | A slow router or engine probe blocks the loop | Registration convergence is delayed | One attempt per pass, strict timeouts, and bounded backoff; the next pass retries |
-| KEP-527 changes the marker ABI | Marker handling needs adjustment | Keep marker observation isolated in the RBG condition and adapter; do not couple router or engine adapters to it |
+| KEP-527 changes the signalLabel ABI | Signal handling needs adjustment | Keep signal observation isolated in the RBG condition and adapter; do not couple router or engine adapters to it |
 | vLLM remove remains unverified | vLLM cannot safely support pre-hooks | Fail closed until a concrete proxy and version are identified |
 | Manual-drain file changes are delayed | Removal happens later than desired | Periodic reread plus optional inotify watch |
-| Unknown membership blocks marker clearing | RBG waits | Expose member and quiescent facts, log the blocking condition, and alert |
+| Unknown membership blocks signal acknowledgment | RBG waits | Expose member and quiescent facts, log the blocking condition, and alert |
 | Engine metrics report a false idle | Traffic is removed too early | Require consecutive zero samples for all applicable metrics |
 
 ## Alternatives Considered
@@ -263,7 +265,7 @@ This is the smallest change, but startup, heartbeat, and SIGTERM can race and re
 
 ### Let RBG call Patio directly
 
-Direct calls are easier to reason about per request, but couple the controller to Patio's network, availability, and business API. Label-based markers keep the controller independent of the executor.
+Direct calls are easier to reason about per request, but couple the controller to Patio's network, availability, and business API. Label-based signals keep the controller independent of the executor.
 
 ### Use explicit registration modes
 
@@ -271,7 +273,7 @@ Direct calls are easier to reason about per request, but couple the controller t
 
 ## Observability
 
-Logs record the effective conditions, RI `resourceVersion`, router query result, reconcile decision, adapter operation, and marker cleanup result. Do not log ServiceAccount tokens.
+Logs record the effective conditions, RI `resourceVersion`, router query result, reconcile decision, adapter operation, and signal acknowledgment result. Do not log ServiceAccount tokens.
 
 Proposed metrics:
 
@@ -281,13 +283,13 @@ Proposed metrics:
 | `patio_reconcile_condition` | Gauge | `condition` | Current condition value |
 | `patio_reconcile_member_state` | Gauge | `engine`, `protocol` | Member fact: present / absent / unknown |
 | `patio_reconcile_quiescent_state` | Gauge | `engine`, `source` | Quiescent fact: yes / no / unknown |
-| `patio_reconcile_action_duration_seconds` | Histogram | `operation` | Router add/remove/query and marker cleanup latency |
+| `patio_reconcile_action_duration_seconds` | Histogram | `operation` | Router add/remove/query and signal acknowledgment latency |
 
 ## Rollout
 
 1. Refactor current registration into the single reconcile loop, router adapters, and engine probes while preserving startup behavior.
 2. Add SGLang bring-up and drain on top of that refactor.
-3. Add RBG marker integration after KEP-527 merges.
+3. Add RBG signalLabel integration after KEP-527 merges.
 4. Add vLLM only after a concrete proxy and version with a confirmable remove API are identified.
 
 ## Test Plan
@@ -299,12 +301,12 @@ Proposed metrics:
 5. Verify SGLang PD drain uses the correct metrics for prefill and decode.
 6. Verify vLLM V1 drain uses running and waiting only.
 7. Verify xPyD-proxy v1.7.0+ add/remove, `X-API-Key`, drain-and-retry, and timeout behavior.
-8. Verify marker clearing only after membership and quiescence facts satisfy the hook.
+8. Verify signal acknowledgment only after membership and quiescence facts satisfy the hook.
 9. Verify projected token isolation between Patio and engine containers.
 
 ## Open Questions
 
-1. Final KEP-527 marker ABI after sgl-project/rbg#546 merges.
+1. Final KEP-527 signalLabel ABI after sgl-project/rbg#546 merges.
 
 ## References
 

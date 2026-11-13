@@ -12,6 +12,8 @@
 
 Patio 成为单个 RoleInstance（RI）的流量调和器。
 
+术语：Patio 侧把自己观察到的触发器称为 `signal`；RBG 在 RoleInstance 上把它编码为 `signalLabel`。
+
 只有一个 reconcile loop 是路由成员关系的写入者。每一轮都先计算当前 worker 是否应该注册，再与路由器报告的实际状态比较，并据此执行 add 或 remove。心跳只是这个循环的周期性执行。启动、SIGTERM、hook 状态变化和 Pod 注解变化都只是事件，它们更新各自的条件并唤醒循环，绝不直接写路由成员关系。
 
 这个设计移除了 `REGISTRY_MODE`、先停心跳再反注册的顺序，以及 hook 任务抢占。Patio 重启后从 RI 当前状态收敛，而不是重放历史事件。
@@ -42,7 +44,7 @@ Patio 启动
 2. 让一个 reconcile loop 成为路由成员关系的唯一写入者。
 3. 从相互独立、可观测的条件推导期望状态。
 4. 让 router adapter 和 engine probe 可以独立变化。
-5. 只有确认移除后才清除 RBG marker。
+5. 只有确认移除后才确认 RBG signal。
 6. 让 Patio 重启后能从当前进程、Pod 和 RI 状态收敛。
 
 ## 非目标
@@ -111,7 +113,7 @@ patio.workloads.x-k8s.io/drain=true
 | Member | present / absent / unknown | 该 instance identity 在路由器中的成员状态 |
 | Quiescent | yes / no / unknown | engine 是否没有在途或排队工作 |
 
-RBG marker 的确认依赖这两个事实：
+RBG signal 的确认依赖这两个事实：
 
 | RBG hook | 需要的事实 |
 | --- | --- |
@@ -180,16 +182,16 @@ vLLM V1 只使用 running 和 waiting。`vllm:num_requests_swapped` 不是 V1 �
 - 上游核心 vLLM 的 `examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py` 只文档化了 `/instances/add`；
 - vLLM Ascend v0.30.0 也有 `/instances/remove`，但其 payload 使用 `type` + `instances` 列表，而不是当前 Patio 使用的单数 `instance` 字段。
 
-### RBG marker 处理
+### signal 观察与确认
 
 Patio 只 watch 由 `LIFECYCLE_RI_NAME` 指定的 RI。
 
-Marker key 名称和状态值有意跟随 KEP-527。由于 sgl-project/rbg#546 仍然打开，本提案保持 draft，并会在该 PR 合并后固定最终 ABI。
+在 engine runtime 中，这个触发器称为 `signal`。RBG 把它编码为 RoleInstance 上的 `signalLabel`。具体的 `signalLabel` key 和 value 有意跟随 KEP-527；由于 sgl-project/rbg#546 仍然打开，本提案保持 draft，并会在该 PR 合并后固定最终 ABI。
 
-清除 marker 之前：
+确认 signal 之前：
 
 1. GET 最新 RI。
-2. 确认 marker key 和 value 仍然匹配。
+2. 确认 signalLabel key 和 value 仍然匹配。
 3. 使用 JSON Merge Patch 只修改该 key。
 4. 使用 GET 返回的 `resourceVersion` 作为乐观并发前置条件。
 5. 冲突时重新 GET 并重试。
@@ -225,7 +227,7 @@ patio/
 | `topo/client/vllm_topo_client.py` | 未来的 `registration/adapters/vllm.py` | remove 可验证前不启用 |
 | `topo/factory.py` | `application.py` 中的 adapter 选择 | `topo/server` 保持不变 |
 | topo client 中的 engine 健康等待 | `engine/probes` | 把 readiness 和 quiescence 与注册分离 |
-| `app.py` 的 startup 和信号处理 | `registration/reconciler.py` | 用条件更新替代直接 register/unregister |
+| `app.py` 的 startup 和进程信号处理 | `registration/reconciler.py` | 用条件更新替代直接 register/unregister |
 | `metrics/engine_metric_rules.py` | 不变 | 由 engine probe 消费 |
 
 ## 安全
@@ -249,10 +251,10 @@ patio/
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
 | router 或 engine probe 响应慢，阻塞循环 | 注册收敛延迟 | 每轮只尝试一次，严格超时和有限退避；下一轮重试 |
-| KEP-527 修改 marker ABI | marker 处理需要调整 | 把 marker 观察隔离在 RBG condition 和 adapter 中；不耦合 router 或 engine adapter |
+| KEP-527 修改 signalLabel ABI | signal 处理需要调整 | 把 signal 观察隔离在 RBG condition 和 adapter 中；不耦合 router 或 engine adapter |
 | vLLM remove 仍未确认 | vLLM 无法安全支持 pre-hook | 在确认具体 proxy 和版本前 fail closed |
 | manual-drain 文件变化延迟 | 移除时机晚于预期 | 周期性重读，辅以可选 inotify |
-| unknown membership 阻塞 marker 清理 | RBG 等待 | 暴露 member 和 quiescent 事实，记录阻塞条件并告警 |
+| unknown membership 阻塞 signal 确认 | RBG 等待 | 暴露 member 和 quiescent 事实，记录阻塞条件并告警 |
 | engine 指标误报 idle | 过早移除流量 | 要求所有适用指标连续多次为零 |
 
 ## 备选方案
@@ -263,7 +265,7 @@ patio/
 
 ### 让 RBG 直接调用 Patio
 
-单次请求更容易理解，但会把 controller 绑定到 Patio 的网络、可用性和业务 API。基于 label 的 marker 让 controller 不依赖具体 executor。
+单次请求更容易理解，但会把 controller 绑定到 Patio 的网络、可用性和业务 API。基于 label 的 signal 让 controller 不依赖具体 executor。
 
 ### 使用显式注册模式
 
@@ -271,7 +273,7 @@ patio/
 
 ## 可观测性
 
-日志记录生效条件、RI `resourceVersion`、router 查询结果、reconcile 决策、adapter 操作和 marker 清理结果。不要记录 ServiceAccount token。
+日志记录生效条件、RI `resourceVersion`、router 查询结果、reconcile 决策、adapter 操作和 signal 确认结果。不要记录 ServiceAccount token。
 
 建议指标：
 
@@ -281,13 +283,13 @@ patio/
 | `patio_reconcile_condition` | Gauge | `condition` | 当前条件值 |
 | `patio_reconcile_member_state` | Gauge | `engine`, `protocol` | member 事实：present / absent / unknown |
 | `patio_reconcile_quiescent_state` | Gauge | `engine`, `source` | quiescent 事实：yes / no / unknown |
-| `patio_reconcile_action_duration_seconds` | Histogram | `operation` | router add/remove/query 和 marker 清理延迟 |
+| `patio_reconcile_action_duration_seconds` | Histogram | `operation` | router add/remove/query 和 signal 确认延迟 |
 
 ## 发布顺序
 
 1. 先把现有注册重构为单 reconcile loop、router adapter 和 engine probe，同时保留 startup 行为。
 2. 在该重构之上加入 SGLang bring-up 和 drain。
-3. KEP-527 合并后，再加入 RBG marker 集成。
+3. KEP-527 合并后，再加入 RBG signalLabel 集成。
 4. 只有确认具体 proxy 和版本支持可确认的 remove API 后，才加入 vLLM。
 
 ## 测试计划
@@ -299,12 +301,12 @@ patio/
 5. 验证 SGLang PD drain 对 prefill 和 decode 使用正确指标。
 6. 验证 vLLM V1 drain 只使用 running 和 waiting。
 7. 验证 xPyD-proxy v1.7.0+ 的 add/remove、`X-API-Key`、drain-and-retry 和超时行为。
-8. 验证只有 membership 和 quiescence 满足 hook 条件后才清除 marker。
+8. 验证只有 membership 和 quiescence 满足 hook 条件后才确认 signal。
 9. 验证 projected token 在 Patio 和 engine 容器之间隔离。
 
 ## 开放问题
 
-1. sgl-project/rbg#546 合并后的最终 KEP-527 marker ABI。
+1. sgl-project/rbg#546 合并后的最终 KEP-527 signalLabel ABI。
 
 ## 参考
 
