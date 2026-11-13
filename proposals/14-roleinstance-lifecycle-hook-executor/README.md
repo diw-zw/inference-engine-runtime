@@ -3,7 +3,7 @@
 | Item | Content |
 | --- | --- |
 | Status | draft |
-| Date | Created 2026-11-04; updated 2026-11-11 |
+| Date | Created 2026-11-04; updated 2026-11-13 |
 | Author | inference-engine-runtime maintainers |
 | Reference | `rbg/keps/527-roleinstance-lifecycle/README.zh-CN.md` |
 | Scope | Patio defines callbacks and RBG invokes them through signalLabels; routing onboarding, offboarding, and drain are the initial capabilities |
@@ -50,7 +50,7 @@ This suits "onboard at startup" deployments, but not instance lifecycles control
 3. Give each operation its own signalLabel. Orchestration writes dependent signalLabels together, and Patio processes them serially in configuration order without bypassing failures.
 4. Inside an offboarding callback, stop heartbeat first, wait for the last register to complete, and then unregister. If drain is required, continue waiting for drain.
 5. Provide a route-cleanup callback that does not wait for engine drain, for use before recovery or during shutdown.
-6. Keep the Executor limited to the signalLabel protocol. Adapters interpret framework differences, and the deployment configures which signal invokes which callback.
+6. Keep the Executor responsible only for ordered execution, failure policies, and acknowledgment timing. The RI hook adapter owns signalLabel observation and acknowledgment; registration / engine adapters handle framework differences, and the deployment configures which signal invokes which callback.
 
 ### Non-Goals
 
@@ -115,7 +115,9 @@ and I want configuration order across different signalLabels to express removal 
 | signalLabel | A signal implementation whose value is a `key=value` RI label. Each operation is triggered and acknowledged independently, and the unique Executor deletes the signalLabel after success. |
 | Callback plugin | An independent asynchronous operation registered by name. It is unaware of RBG hooks and signalLabels and is not responsible for Kubernetes writeback. |
 | `HookBinding` | A binding between one signal source and one callback. The current signal source is signalLabel, and list order defines detection and serial processing order. |
-| Executor | The component that runs start / end callbacks, observes the RI, executes matching callbacks in order, retries, and clears signalLabels. |
+| Executor | The component that runs start / end callbacks, processes hook bindings in order, retries, and requests acknowledgment from the hook adapter after callback success. |
+| hook adapter | An external signal protocol integration that owns observation, match revalidation, and completion acknowledgment. The first implementation uses RI signalLabels. |
+| ack / completion acknowledgment | Confirmation of a triggering signal after callback success. The RI implementation conditionally removes the signalLabel and confirms the result; this is not unconditional post-processing. |
 | registration | The protocol for a worker to join or leave the router or proxy member list. |
 | endpoint | The access address for the router / proxy, worker, or engine health. |
 | heartbeat | A self-healing mechanism that periodically calls register to restore registration after a router restart. |
@@ -139,28 +141,37 @@ It is neither an RI-level traffic controller nor a lifecycle Executor.
 
 ### Target architecture
 
+Organize around configurable operation execution, not the RoleInstance lifecycle: `application` assembles resources, `events` schedules operations, `hooks` integrates and acknowledges signals, `callbacks` exposes business actions, and `registration` / `engine` implements business capabilities. Patio does not interpret RBG lifecycle phases; RI labels are currently the only hook integration protocol.
+
 ```mermaid
 flowchart TB
     C["RBG / orchestration system"] -->|write signalLabel group| R[("RoleInstance labels")]
-    F["event_callbacks configuration"] --> B["Plugin registration and binding resolution"]
-    B --> X["Executor: start / ordered signalLabels / end"]
-    R -->|direct LIST/WATCH| W["RI watcher / signalLabel client"]
-    W -->|latest labels snapshot| X
-    X -->|clear corresponding signalLabel after callback success| W
-    W -->|GET / PATCH| R
+    F["event_callbacks configuration"] --> B["application: dependency assembly, registration, binding resolution"]
+    B --> X["events/executor: start / ordered hooks / end"]
+    B -->|create required resources| W["events/hooks/roleinstance: RI hook adapter"]
+    R -->|direct LIST/WATCH| W
+    W -->|latest snapshot, matching and revalidation results| X
+    X -->|request ack after callback success| W
+    W -->|GET / conditional PATCH / confirmation| R
     R -->|completion acknowledgment for each signalLabel| C
-    X --> P["Independent Callback plugins"]
-    P --> T["Shared business dependencies / heartbeat"]
-    T --> A["registration / drain adapters"]
-    E["endpoint resolver"] --> A
-    A --> U["Router / Proxy / Engine"]
+    X -->|invoke bound callable| P["callbacks: independent operation entry points"]
+    P --> S["registration/service: registration coordination"]
+    S --> H["registration/heartbeat: periodic registration and settling"]
+    S --> A["registration adapters"]
+    H --> A
+    P --> E["engine: readiness and drain capabilities"]
+    S --> E
+    A --> U["Router / Proxy"]
+    E --> I["Engine"]
 ```
 
-Start, hook, and end can be configured together and are all converted into the same execution structure. Hook input is a signal; the current implementation supports only signalLabel, and other signal sources can be added later. Without hook bindings, no Kubernetes watcher is created. Without registration-related callbacks, Patio neither starts heartbeat nor modifies router membership. Plugins may share business dependencies, but they do not share an RBG hook interface.
+Start, hook, and end can be configured together and reuse callback invocation while retaining distinct failure policies. Without hook bindings, no Kubernetes client / watcher is created. Without registration-related callbacks, no registration service is created, heartbeat is not started, and router membership is not modified. Plugins may share business dependencies, but do not share an RBG hook interface.
+
+There is no top-level `lifecycle/`, business-wide `runtime/`, or intermediate `events/handler/` layer. The Executor owns execution state such as starting, processing, and stopping; the registration service owns registration and heartbeat state; the RI hook adapter owns observation snapshots and connection state. They do not form a global state machine that infers the RBG lifecycle.
 
 ### Directory changes
 
-`api/`, `engine/`, and `metrics/` are unrelated to this proposal and remain unchanged.
+Preserve the existing responsibilities of `api/`, `engine/`, and `metrics/`. Move engine health checks out of topo clients into `engine/`, adding readiness waiting and drain-state capabilities without reorganizing the existing LoRA API or metrics exposition path.
 
 Current structure:
 
@@ -181,51 +192,102 @@ patio/
     └── utils.py
 ```
 
-Target structure:
+Target structure (`__init__.py` omitted):
 
 ```text
 patio/
-├── app.py
+├── app.py                      # CLI and process entry point
+├── application.py              # Dependency assembly, tasks, shutdown
+├── config.py
 ├── envs.py
-├── api/
-├── engine/
-├── metrics/
-├── lifecycle/              # RI observation and signalLabel writeback
-├── runtime/
-│   ├── callback_registry.py
-│   ├── executor.py
-│   ├── callbacks/          # Independent business operations
-│   └── heartbeat/
+├── endpoints.py                # Address resolution; no top-level package yet
+├── events/
+│   ├── config.py               # Event configuration and compatibility defaults
+│   ├── bindings.py             # Ordered bindings and configuration resolution
+│   ├── registry.py             # Callback registration mechanism
+│   ├── executor.py             # Start, hook, and end execution flow
+│   └── hooks/
+│       └── roleinstance.py     # RI observation, revalidation, conditional ack
+├── callbacks/
+│   ├── engine.py               # engine_wait_ready and other operation entry points
+│   └── router.py               # onboard / offboard / cleanup entry points
 ├── registration/
-└── endpoint/
+│   ├── service.py              # Internal safety ordering and shared state
+│   ├── heartbeat.py            # Periodic registration and in-flight settling
+│   ├── base.py                 # Registration protocol interface
+│   ├── factory.py
+│   ├── sglang.py               # SGLang router protocol
+│   └── vllm.py                 # vLLM proxy protocol
+├── engine/                     # Health, drain state, existing LoRA capabilities
+├── api/
+├── metrics/
+└── topo/                       # Server and necessary migration compatibility entry points
 ```
 
 Migration:
 
 | Current | Target | Change |
 | --- | --- | --- |
-| `topo/client/*` | `registration/` | Retain only the SGLang / vLLM membership registration protocols |
-| Address derivation in `topo/utils.py` | `endpoint/` | Derive router / worker / engine endpoints independently |
-| Heartbeat loop in `app.py` | `runtime/heartbeat/` | Encapsulate periodic register with start / stop |
-| Startup and signal orchestration in `app.py` | `runtime/executor.py` | Execute configured start, hook, and end uniformly without a registration bypass |
-| New | `runtime/callback_registry.py`, `runtime/callbacks/` | Register independent callbacks and share required dependencies during assembly |
-| New | `lifecycle/` | Watch the RI directly and provide the latest snapshot and conditional signalLabel cleanup |
-| `topo/server/` | Unchanged | Unrelated to the Callback Executor main path |
+| Registration protocols in `topo/client/*` | `registration/base.py`, `sglang.py`, `vllm.py` | Retain only register / unregister / status primitives |
+| Client factory in `topo/factory.py` | `registration/factory.py` | Select the registration adapter; keep the server factory in topo |
+| Address derivation in topo clients and `topo/utils.py` | `endpoints.py` | Resolve router / worker / engine addresses independently |
+| Health waiting in topo clients | `engine/` | Distinguish actual engine readiness from HTTP address reachability |
+| Heartbeat in `app.py` and the topo base class | `registration/heartbeat.py` | Unify periodic registration into a startable, stoppable, settleable task |
+| Startup and signal orchestration in `app.py` | `application.py`, `events/executor.py` | Separate resource management from scheduling; remove direct registration / unregistration bypasses |
+| New | `events/registry.py`, `events/config.py`, `events/bindings.py`, `callbacks/` | Register, validate, and bind independent operations |
+| New | `registration/service.py` | Coordinate adapters, heartbeat, and engine capabilities to guarantee internal safety ordering |
+| New | `events/hooks/roleinstance.py` | Provide RI snapshots, match revalidation, and completion acknowledgment |
+| `topo/server/` | Unchanged | Do not migrate it with the client; it is outside this change's main path |
 
 ### Module boundaries
 
 | Module | Responsibility | Not responsible for |
 | --- | --- | --- |
-| `lifecycle` | Observe the specified RI, read labels, and clear specified signalLabels | RBG hook recognition, business operations, finalizers, election |
-| `runtime/executor` | Schedule start / end, match signalLabels in configuration order, execute serially, and retry | RBG hook classification, router protocol |
-| `runtime/callbacks` | Independent operations such as onboarding, traffic removal and drain, and route cleanup, including their internal safety ordering | Observing the RI, clearing signalLabels, choosing binding locations |
-| `registration` | SGLang / vLLM register / unregister protocols | Deciding when to invoke them |
-| `endpoint` | Derive router / worker / engine addresses | Registration protocol |
-| `heartbeat` | Start / stop encapsulation for periodic register | Lifecycle decisions |
+| `application.py` | Assemble resources and callbacks from configuration; coordinate HTTP serving, background tasks, and shutdown | Direct registration business operations, interpreting RI lifecycles |
+| `events/config.py`, `bindings.py`, `registry.py` | Configuration validation, name registration, and ordered bindings; the RI hook module supplies label syntax rules | Creating business clients, invoking callbacks |
+| `events/executor.py` | Ordered scanning, serial invocation, failure retries, shutdown deadlines, acknowledgment timing | Kubernetes GET / PATCH, router protocols, heartbeat control |
+| `events/hooks/roleinstance.py` | RI LIST/WATCH, snapshot matching, GET revalidation, conditional PATCH and confirmation | Invoking callbacks, deciding business completion, finalizers, election |
+| `callbacks/` | Expose named asynchronous operations calling bound business services or engine capabilities | Signal observation and acknowledgment, choosing binding locations |
+| `registration/service.py` | Safe onboarding / offboarding / cleanup ordering; coordinate registration state, heartbeat, and drain | Event scheduling, RI state, Kubernetes writeback |
+| `registration/heartbeat.py` | Start / stop periodic register and settle in-flight calls | Deciding when to onboard or offboard |
+| `registration` adapters | SGLang / vLLM registration, unregistration, and membership confirmation | Heartbeat scheduling, event retries, drain decisions |
+| `engine/` | Engine readiness checks, drain state, and framework differences | Route registration, signalLabel acknowledgment |
+| `endpoints.py` | Resolve addresses from environment variables and instance configuration | Network registration, event scheduling |
+
+`events/executor.py` invokes only bound callables and the hook adapter; it does not import concrete callback modules or a Kubernetes SDK. `events/registry.py` does not import business plugins in reverse; `application.py` assembles these modules explicitly. Keeping `callbacks/` outside `events/` separates business operations from triggering protocols. Registration / engine capability layers do not depend on the event layer.
+
+### Signal observation and acknowledgment
+
+Observation and acknowledgment belong to the same hook protocol and reside in the same adapter, without a separate generic post-processing module. The Executor decides when to acknowledge; the adapter decides how:
+
+```text
+Hook adapter provides the current snapshot
+  -> Executor matches in configuration order
+  -> Adapter revalidates the current signal
+  -> Executor awaits callback()
+  -> Adapter acknowledges: conditionally clear and confirm
+  -> Executor processes the next binding
+```
+
+An RI label represents a currently pending request, not one business invocation per WATCH notification. The watcher updates the latest snapshot and wakes the Executor instead of queuing each notification as an independent callback task. Failure retries can also wake the processing loop. Callback success is a prerequisite for acknowledgment, which must not run unconditionally in `finally`. Withdrawal or a changed value requires rescanning and does not mean business success. No exactly-once guarantee is provided.
+
+| Entry point | Failure policy | Completion acknowledgment |
+| --- | --- | --- |
+| start | Stop subsequent start / hook operations and enter bounded cleanup | None |
+| hook | Retain the pending signal, stop the pass, and retry with backoff | Adapter performs it after callback success |
+| end | Best-effort execution within one shared shutdown deadline | None |
+
+### Application assembly and resource ownership
+
+1. `application.py` loads configuration, explicitly imports trusted plugins, creates an application-scoped callback registry, and completes dependency validation and binding before the first invocation. Require only resources needed by selected operations; for example, configuring only `router_cleanup` does not require engine drain capabilities.
+2. Router callbacks in one application share one registration service, adapter, and heartbeat. The process-level registry contains only stateless plugin definitions. Callables bound to clients belong to the current application, not a global registry shared across applications.
+3. The application and Uvicorn use one coordinated shutdown entry point, with signal handling established before any start callback. First settle the Executor's current operation, then ask created business resources to stop background activity, run end through the Executor, and finally close resources. All steps share one shutdown budget; the Executor never calls heartbeat directly.
+4. Even with empty end, local background tasks must stop without implicitly unregistering. Startup business waiting runs in a managed task without blocking HTTP serving; hooks do not run until start completes. Assembly or startup failure must also close resources already created.
+5. The event path uses cancellable asynchronous I/O with timeouts and asynchronous backoff. Wrapping existing synchronous `requests` / `time.sleep` calls in `async def` is insufficient. Any transitional bridge to synchronous calls must track and settle in-flight work; canceling the waiting coroutine does not mean the underlying request has stopped.
 
 ### Registration semantics
 
-Registration encapsulates only the membership registration protocol:
+`registration` contains a business service and protocol adapters. `service.py` guarantees internal onboarding / offboarding ordering and manages shared state; adapters encapsulate only membership registration primitives:
 
 ```text
 register
@@ -261,7 +323,7 @@ worker endpoint
 engine health endpoint
 ```
 
-Heartbeat is a self-healing mechanism that periodically calls register, not an offboarding controller:
+Heartbeat resides in `registration/heartbeat.py` and is owned by the registration service. It is a self-healing mechanism that periodically calls register, not an event scheduler or offboarding controller:
 
 1. After `start()`, register periodically.
 2. After `stop()`, do not schedule new register calls.
@@ -290,7 +352,7 @@ scope:   Namespaced
 
 Both reads and writes target the RI. Patio does not rely on propagating RI labels to the Pod and then reading Downward API files, avoiding repeated observation of old labels caused by propagation delay.
 
-The Executor reads only the keys and values of configured signalLabels. It does not depend on `rbg.workloads.x-k8s.io/role-instance-hook-state` or `rbg.workloads.x-k8s.io/role-instance-lifecycle-state`. Missing labels, unknown values, or changes to these labels neither change callback matching nor preempt tasks.
+The RI hook adapter matches only the keys and values of configured signalLabels, and the Executor consumes its snapshots and revalidation results. Neither depends on `rbg.workloads.x-k8s.io/role-instance-hook-state` or `rbg.workloads.x-k8s.io/role-instance-lifecycle-state`. Missing labels, unknown values, or changes to these labels neither change callback matching nor preempt tasks.
 
 ### Coordination flow
 
@@ -395,10 +457,10 @@ The RBG Role's `lifecycle.labelsHandler` defines the hook-to-signalLabel mapping
 
 ### Signal behavior
 
-Install SIGTERM / SIGINT handling before executing any start callback. After receiving a signal:
+Before any start callback, `application.py` establishes a SIGTERM / SIGINT shutdown entry point coordinated with Uvicorn. Do not retain a separate topo unregistration signal handler. After receiving a signal:
 
 1. Stop accepting new hook work, interrupt retry waits, and cooperatively cancel / settle the current callback. Do not let it run concurrently with end callbacks.
-2. Stop this process's heartbeat and wait for in-flight register calls to settle, then execute end callbacks in configuration order.
+2. The application asks the created registration service to stop heartbeat and settle in-flight register calls, then has the Executor run end callbacks in configuration order. The Executor is unaware of the heartbeat implementation.
 3. End callbacks share one shutdown deadline and run best-effort. After logging a failure, processing may continue to the next entry; exit when the deadline is exhausted. The process shutdown budget provides the deadline, which must be shorter than the Pod's remaining termination grace period and is not restarted for each entry.
 4. Signals are not interpreted as any RBG hook, and interrupted signalLabel invocations are not cleared. End callbacks have no signalLabel writeback authority.
 5. Finally close watchers, clients, and all local background tasks. Even if an end callback starts background tasks, they cannot extend the process shutdown deadline.
@@ -411,7 +473,7 @@ The following code is pseudocode. It expresses execution order and module collab
 
 ### Callback plugin registration
 
-Shared registry module `runtime/callback_registry.py`:
+Shared registry module `events/registry.py`. The global registry contains only stateless callbacks; dependency-bound operations use an application-scoped registry:
 
 ```python
 from collections.abc import Awaitable, Callable
@@ -421,52 +483,56 @@ EventCallback = Callable[[], Awaitable[None]]
 callback_plugins: dict[str, EventCallback] = {}
 
 
-def register_callback(name: str) -> Callable[[EventCallback], EventCallback]:
+def register_callback(
+    name: str,
+    *,
+    registry: dict[str, EventCallback] | None = None,
+) -> Callable[[EventCallback], EventCallback]:
+    target = callback_plugins if registry is None else registry
+
     def decorator(callback: EventCallback) -> EventCallback:
-        if name in callback_plugins:
+        if name in target:
             raise ValueError(f"Duplicate Callback plugin registration: {name}")
-        callback_plugins[name] = callback
+        target[name] = callback
         return callback
 
     return decorator
 ```
 
-Independent plugin module `runtime/callbacks/router.py`; only signatures and responsibilities are declared here:
+Independent plugin module `callbacks/router.py` registers operations bound to the same registration service during assembly. The service implements safety steps without requiring a global client:
 
 ```python
-from ..callback_registry import register_callback
+from patio.events.registry import register_callback
 
 
-@register_callback("router_onboard")
-async def router_onboard() -> None:
-    # Confirm engine readiness, register routes, and start heartbeat.
-    ...
+def register_callbacks(registry, registration):
+    @register_callback("router_onboard", registry=registry)
+    async def router_onboard() -> None:
+        await registration.onboard()
 
+    @register_callback("router_offboard", registry=registry)
+    async def router_offboard() -> None:
+        await registration.offboard()
 
-@register_callback("router_offboard")
-async def router_offboard() -> None:
-    # Stop heartbeat, settle in-flight registration, unregister, and drain.
-    ...
-
-
-@register_callback("router_cleanup")
-async def router_cleanup() -> None:
-    # Stop heartbeat, settle in-flight registration, and unregister; do not wait for engine drain.
-    ...
+    @register_callback("router_cleanup", registry=registry)
+    async def router_cleanup() -> None:
+        await registration.cleanup()
 ```
 
-Decorators only save function references during module import and do not execute business operations. At application startup, explicitly import trusted plugin modules before validating configuration. Adding a file alone does not discover it. YAML cannot specify arbitrary module paths or use `eval`. The shared registry does not import business plugins in reverse.
+`application.py` first copies the stateless registry, then calls the assembly functions of required plugin modules. `callbacks/engine.py` binds engine capabilities in the same way. Every registered name must be unique within the application registry; reject startup if configuration references a capability that has not been assembled.
 
-When router clients, heartbeat, engine state, or other state must be shared, register callables with bound dependencies during assembly using `register_callback(name)(bound_callback)`. This is an alternative to decorator registration, and the same name must not be registered twice. The registered callable remains a zero-argument asynchronous operation; there is no requirement to implement a unified multi-event handler differentiated by RBG hook. Dependency assembly must complete before the first invocation.
+Decorators save function references without executing business operations. Stateless plugins can register during import with `@register_callback("plugin_name")`; dependency-bound plugins specify the application `registry` inside an assembly function. At startup, explicitly import trusted modules, assemble selected capabilities, validate names, and then generate bindings. Adding a file alone does not discover it, and YAML cannot specify arbitrary module paths or use `eval`. The shared registry does not import business plugins in reverse.
+
+Alternatively, register a dependency-bound callable with `register_callback(name, registry=app_callbacks)(bound_callback)`; the same name cannot also be registered by a decorator. The callable remains a zero-argument asynchronous operation, without a unified multi-event handler differentiated by RBG hook. Different application instances use separate registries and business objects, avoiding duplicate assembly conflicts or accidental use of another instance's clients.
 
 ### Configuration to execution structures
 
-The following input has passed structural, plugin-name, and signalLabel validation described in "User Configuration":
+`events/bindings.py` converts configuration into ordered execution structures. The input below has passed the structural, plugin-name, and signalLabel validation described in "User Configuration"; the `callback_plugins` argument is the assembled application registry:
 
 ```python
 from dataclasses import dataclass
 
-from .callback_registry import EventCallback
+from .registry import EventCallback
 
 
 @dataclass(frozen=True)
@@ -506,14 +572,14 @@ The YAML field name is `signalLabel`; the internal Python field uses `signal_lab
 flowchart TD
     A["Start, register plugins, validate configuration"] --> B["Run start callbacks in order"]
     B -->|success| C{"Any hook bindings?"}
-    B -->|failure| H["Settle current task, stop heartbeat"]
+    B -->|failure| H["application coordinates: settle current task, stop background registration"]
     C -->|no| W["Wait for shutdown"]
-    C -->|yes| L["LIST/WATCH RI labels"]
+    C -->|yes| L["hook adapter: LIST/WATCH RI labels"]
     L --> D["Scan current snapshot from the first binding"]
     D --> E{"Current signalLabel matches?"}
     E -->|no| N{"More bindings?"}
-    E -->|yes| F["GET to recheck, then await callback"]
-    F -->|success| G["Clear and confirm own signalLabel"]
+    E -->|yes| F["Adapter revalidates, then Executor awaits callback"]
+    F -->|success| G["hook adapter ack: conditionally clear and confirm"]
     G -->|success| N
     F -->|failure| R["Stop pass; back off and GET a fresh snapshot"]
     G -->|failure| R
@@ -526,25 +592,25 @@ flowchart TD
     N -->|no| L
     L -. SIGTERM / SIGINT .-> H
     W -. SIGTERM / SIGINT .-> H
-    H --> I["Run end callbacks in order; exit within deadline"]
+    H --> I["Executor runs end callbacks in order"]
+    I --> Z["application closes resources; exit within shared deadline"]
 ```
 
-The signal entry points in the diagram apply throughout the lifecycle, including while start is waiting. The HTTP API can serve independently. signalLabel callbacks do not execute before start completes.
+This diagram shows collaboration among the application, Executor, and hook adapter; not every step is implemented inside the Executor. Signals apply throughout process execution, including while start is waiting. If the current task cannot settle within the deadline, end must not run concurrently. The HTTP API can serve independently; signalLabel callbacks do not execute before start completes.
 
-The following illustrates one ordered pass. The `ri_client` confirmation method follows "signalLabel deletion": return `True` for confirmed cleanup, return `False` when withdrawal / a changed value requires a rescan, and raise an exception on call failure:
+One ordered pass resides in `events/executor.py`. `hook` is the RI hook adapter: `revalidate` GETs the current signal for revalidation; `ack` follows "signalLabel deletion", returning `True` for confirmed cleanup, `False` when withdrawal / a changed value requires rescanning, and raising an exception on call failure. The adapter provides the RI snapshot and its matching method; the Executor never accesses Kubernetes directly:
 
 ```python
-async def process_snapshot(snapshot, hook_bindings, ri_client):
+async def process_snapshot(snapshot, hook_bindings, hook):
     for binding in hook_bindings:
         if not snapshot.matches(binding.signal_label):
             continue
 
-        latest = await ri_client.get()
-        if not latest.matches(binding.signal_label):
+        if not await hook.revalidate(binding.signal_label):
             return
 
         await binding.callback()
-        if not await ri_client.clear_and_confirm(binding.signal_label):
+        if not await hook.ack(binding.signal_label):
             return
 ```
 
@@ -564,15 +630,18 @@ Execution rules:
 
 | Callback | Mandatory internal order | Typical signals, not restrictions |
 | --- | --- | --- |
+| `engine_wait_ready` | Wait for actual engine readiness without registering | start or a signalLabel requiring readiness waiting |
 | `router_onboard` | Confirm engine ready → register successfully → start heartbeat | start or an onboarding signalLabel |
 | `router_offboard` | Stop heartbeat → settle in-flight register → unregister / confirm absence → wait for stable idle | offboarding / pre-deletion signalLabel, or end |
 | `router_cleanup` | Stop heartbeat → settle in-flight register → unregister / confirm absence; no engine drain | pre-recovery signalLabel, or end |
 
-Mandatory safety steps cannot be delegated to users for split ordering. For example, `router_offboard` internally guarantees that heartbeat stops before unregistration, and heartbeat remains stopped during failure retries. An unknown unregistration result must raise an error rather than return success. Canceling only the local register coroutine does not prove that the remote request had no effect. The adapter must settle in-flight registration before confirming member removal.
+Router callbacks are operation entry points; the shared `registration/service.py` implements the internal ordering above. `engine_wait_ready` calls the engine capability directly. Even with a standalone waiting callback, `router_onboard` must enforce its own readiness precondition rather than assume that `engine_wait_ready` ran earlier.
+
+Mandatory safety steps cannot be delegated to users for split ordering. For example, `router_offboard` uses the registration service to stop heartbeat before unregistration, and heartbeat remains stopped during failure retries. An unknown unregistration result must raise an error rather than return success. The registration service coordinates heartbeat and the adapter to settle in-flight registration before confirming member removal; canceling only the local register coroutine does not prove that the remote request had no effect.
 
 `router_cleanup` does not depend on engine metrics. If the engine is dead or drain is `unknown` / `unsupported`, it succeeds as long as member removal is confirmed. `router_offboard`, which requires drain, continues to fail closed.
 
-These callbacks receive no signalLabel, read no RI lifecycle state, and perform no PATCH themselves. After successful return, the Executor clears the signalLabel. Start / end have no signalLabel completion acknowledgment.
+These callbacks receive no signalLabel, read no RI lifecycle state, and perform no PATCH themselves. After successful return, the Executor asks the hook adapter to acknowledge and clear the signalLabel. Start / end have no signalLabel completion acknowledgment.
 
 ### Cross-feature ordering: routing and KVCache
 
@@ -603,7 +672,7 @@ There is no need to change `callback` into a list. The Executor knows only detec
 
 ### Drain snapshot
 
-The runtime defines only common drain semantics. Each inference framework's adapter interprets what "active / queued / drained" means.
+`engine/` defines the common drain snapshot, with each framework adapter interpreting what "active / queued / drained" means. `registration/service.py` consumes snapshots and waits for stable idle; the Executor does not interpret drain metrics.
 
 ```text
 state: idle | draining | unknown | unsupported
@@ -696,6 +765,7 @@ vLLM metrics can cover streaming requests that are still generating, but cannot 
 6. When vLLM drain is required, running / waiting / swapped gauges must be provided; missing gauges return `unsupported`. This requirement does not apply to `router_cleanup`, which performs no drain.
 7. Upgrade Patio and router / proxy before deploying signalLabel bindings. Before rollback, stop new orchestration operations and resolve all unfinished signalLabels. Do not directly switch to startup-onboarding configuration or remove the event file.
 8. Adding plugins does not imply support for arbitrary scripts or HTTP check entry points. New metrics and logs are additive capabilities; changes to existing metrics require separate migration guidance.
+9. This module reorganization retains the `signalLabel` configuration field, `LIFECYCLE_*` parameters, and the `patio_lifecycle_*` metric names below. Removing the top-level lifecycle module does not change external interfaces; these names do not imply that Patio manages the RBG lifecycle.
 
 ## Observability
 
@@ -736,7 +806,7 @@ Troubleshooting:
 ## Performance and Scalability
 
 1. Each Callback Executor watches only one specified RoleInstance and uses a field selector or client-side filtering to avoid a namespace-wide informer.
-2. The local cache needs only the current RI object and internal traffic state. On resourceVersion expiry or watch reconnection, LIST/GET again without retaining historical objects.
+2. The RI hook adapter caches the current RI object; the registration service separately owns local traffic / heartbeat state. On resourceVersion expiry or watch reconnection, LIST/GET again without retaining a historical event queue.
 3. Heartbeat retains `HEARTBEAT_INTERVAL`. Periodic registration runs only when a relevant callback starts heartbeat; signalLabel observation itself adds no periodic writes.
 4. Drain polling uses an independent interval and minimum sample count. The stable window is implicitly determined by `LIFECYCLE_DRAIN_CHECK_INTERVAL` × `LIFECYCLE_DRAIN_STABLE_SAMPLES`. Request failures count toward backoff and are not treated as idle samples.
 5. With hook bindings, each process adds one Kubernetes watch connection and detects N bindings in O(N) per pass. Metric cardinality is bounded by combinations of registered callback / event / result / engine / source values.
@@ -788,7 +858,7 @@ This could choose an Executor automatically, but introduces leases, authorizatio
 
 ### Unit tests
 
-1. Registration: imports record references only; duplicate names are rejected; new modules require explicit import; dependency-bound and decorator registration cannot duplicate a name.
+1. Registration: imports execute no business operations; stateless definitions and application bindings are separate; duplicate names are rejected; new modules require explicit import. Multiple applications have isolated registries and clients, while router callbacks within one application share the registration service.
 2. Configuration: reject unknown fields / plugins, wrong types, duplicate YAML keys, null lists, invalid signalLabels, and duplicate bindings of the exact same signalLabel; allow the same key with different values. Omitted sections and empty lists are valid; distinguish empty label values from missing keys.
 3. Defaults: without an event file, generate default bindings based on whether the topo client was enabled. Explicit empty configuration performs no registration. File read failures and old-draft ENVs do not silently fall back. Nonempty hooks require an RI name.
 4. Mapping: all three lists preserve order, each `HookBinding` has only one callback, and there is no event-name or handler enumeration.
@@ -799,6 +869,8 @@ This could choose an Executor automatically, but introduces leases, authorizatio
 9. Business callbacks: onboard checks readiness itself; offboard stops heartbeat, settles in-flight register, unregisters, and drains; cleanup never accesses engine drain; retries do not restart heartbeat.
 10. Drain: all applicable SGLang running / queue and vLLM running / waiting / swapped gauges must remain zero for the required consecutive samples before idle. Missing metrics are unsupported; network / parse / NaN failures are unknown; any non-idle sample resets the count.
 11. Signals: exit is possible while start is waiting. The current callback and end do not run concurrently. End runs in order with a shared deadline and best-effort failures, and does not clear hook signalLabels. Without end, only local resources are settled.
+12. Module boundaries: test the Executor independently with fake callbacks / hook adapters. Callback failure must not invoke ack, and ack failure must block the next entry. The event layer never controls heartbeat directly or imports business clients.
+13. Capability dependencies: empty hook creates no Kubernetes client; cleanup alone does not require engine drain; unselected business capabilities require no corresponding dependencies. Standalone engine_wait_ready does not register, and onboard does not depend on that callback having run earlier.
 
 ### Integration tests
 
@@ -807,6 +879,7 @@ This could choose an Executor automatically, but introduces leases, authorizatio
 3. Mock engine metrics verifies complete offboard ordering and retained signalLabels after partial failures.
 4. Test callbacks simulate routing / KVCache: set two signalLabels in the same update, verify item-by-item acknowledgment and failure blocking, without implementing KVCache.
 5. Verify default-binding compatibility, no registration with explicit empty start, no Kubernetes access with empty hook, and effective end configuration on signals.
+6. Verify coordinated shutdown with Uvicorn: start waiting does not block HTTP serving; startup failure cleans partially created resources; shutdown settles the current operation and background registration before end. Empty end does not implicitly unregister, and all resources share one shutdown budget.
 
 ### End-to-end tests
 
@@ -832,12 +905,13 @@ Do not promise a business drain-time SLO. Measure CPU, memory, file descriptor, 
 
 ## Rollout
 
-1. Complete module separation, plugin registration, and default bindings. Replace legacy startup / signal bypasses and run compatibility regressions.
-2. Implement event files, the ordered Executor, RI watcher, and conditional cleanup. Add RBAC, the capability matrix, logs, and metrics.
-3. Have orchestration inject explicit start / signalLabel / end configuration. Validate existing RBG hook mappings, multiple-signalLabel ordering, and retriggering after Executor restart at small scale.
-4. Expand after confirming there are no residual signalLabels, ordering errors, or unintended registrations.
-5. Before rollback, stop new operations and resolve unfinished signalLabels. Replace configuration or roll back the version only after confirming that startup registration may be restored. Do not treat manual signalLabel deletion as success.
-6. Migrate explicitly when the signalLabel protocol changes. If RBG only adjusts hook names or hook-to-signalLabel mappings while the signalLabel protocol remains unchanged, no Executor dispatch changes are required.
+1. Separate business capabilities first: extract registration adapters, heartbeat, the registration service, and `endpoints.py`; place health / drain capabilities in `engine/`. Preserve the topo server and necessary compatibility entry points.
+2. Establish `application.py`, `events/`, and independent `callbacks/`. Implement application-scoped dependency binding, event files, and compatibility defaults; remove legacy startup registration / signal unregistration bypasses and validate asynchronous I/O and coordinated shutdown.
+3. Integrate observation, revalidation, and acknowledgment in `events/hooks/roleinstance.py` without changing callback interfaces. Add RBAC, the capability matrix, logs, metrics, and ordering / retry tests.
+4. Have orchestration inject explicit start / signalLabel / end configuration. Validate existing RBG hook mappings, multiple-signalLabel ordering, and retriggering after Executor restart at small scale.
+5. Expand after confirming there are no residual signalLabels, ordering errors, or unintended registrations.
+6. Before rollback, stop new operations and resolve unfinished signalLabels. Replace configuration or roll back the version only after confirming that startup registration may be restored. Do not treat manual signalLabel deletion as success.
+7. Migrate explicitly when the signalLabel protocol changes. If RBG only adjusts hook names or hook-to-signalLabel mappings while the signalLabel protocol remains unchanged, no Executor dispatch changes are required.
 
 ## Open Questions
 

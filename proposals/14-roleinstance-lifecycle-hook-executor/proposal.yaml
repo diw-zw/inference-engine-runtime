@@ -1,4 +1,4 @@
-title: Patio as RoleInstance Lifecycle Hook Executor
+title: Patio as RoleInstance Callback Executor
 proposal-number: 14
 authors:
   - diw-zw
@@ -11,13 +11,16 @@ approvers:
 status: draft
 
 creation-date: 2026-11-06
-last-updated: 2026-11-10
+last-updated: 2026-11-13
 
 # Component(s) primarily affected by this change.
 areas:
+  - application
+  - events
+  - callbacks
+  - registration
+  - engine
   - topo
-  - runtime
-  - lifecycle
   - deployment
   - documentation
 

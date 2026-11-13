@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 | --- | --- |
 | 状态 | draft |
-| 日期 | 2026-11-04 创建，2026-11-11 更新 |
+| 日期 | 2026-11-04 创建，2026-11-13 更新 |
 | 作者 | inference-engine-runtime 维护者 |
 | 参考 | `rbg/keps/527-roleinstance-lifecycle/README.zh-CN.md` |
 | 范围 | Patio 定义 callback，RBG 通过 signalLabel 触发调用；以路由上下线和排空为首批能力 |
@@ -50,7 +50,7 @@ Patio 启动
 3. 多个操作各用独立 signalLabel；编排系统同时写入有依赖的 signalLabel，Patio 按配置顺序串行处理，失败不绕过。
 4. 下线 callback 内部先停止 heartbeat，等待最后一次 register 完成，再注销；需要排空时继续等待 drain。
 5. 提供不等待 engine 排空的路由清理 callback，供恢复前或退出时使用。
-6. Executor 仅理解 signalLabel 协议；框架差异由 adapter 解释，哪个信号调用哪个 callback 由部署方配置。
+6. Executor 只负责有序执行、失败策略和确认时机；RI hook adapter 负责 signalLabel 观察与确认协议，registration / engine adapters 负责框架差异，部署方配置哪个信号调用哪个 callback。
 
 ### 非目标
 
@@ -115,7 +115,9 @@ Patio 启动
 | signalLabel | signal 的一种实现，值为 RI label 中的 `key=value`；每个操作独立触发、独立确认，成功后由唯一 Executor 删除。 |
 | Callback plugin | 以名称注册的独立异步操作，不感知 RBG hook 和 signalLabel，不负责 Kubernetes 写回。 |
 | `HookBinding` | 一个 signal 来源与一个 callback 的绑定；当前 signal 来源是 signalLabel，列表顺序就是检测和串行处理顺序。 |
-| Executor | 运行 start / end callbacks，观察 RI、按序执行匹配的 callback、重试并清除 signalLabel 的组件。 |
+| Executor | 运行 start / end callbacks，按序处理 hook 绑定、重试，并在 callback 成功后请求 hook adapter 确认完成的组件。 |
+| hook adapter | 外部信号协议的接入组件，负责观察、匹配复核与完成确认；首版实现为 RI signalLabel。 |
+| ack / 完成确认 | callback 成功后对触发信号的确认；RI 实现为条件清除 signalLabel 并确认结果，不是无条件运行的后处理。 |
 | registration | worker 加入 / 退出 router 或 proxy 成员列表的协议。 |
 | endpoint | router / proxy、worker、engine health 的访问地址。 |
 | heartbeat | 周期性调用 register 的自愈机制，用于 router 重启后恢复注册。 |
@@ -139,28 +141,37 @@ Patio 启动
 
 ### 目标架构
 
+以“可配置的操作执行”为核心，而不是以 RoleInstance lifecycle 为核心：`application` 装配资源，`events` 调度操作，`hooks` 接入并确认信号，`callbacks` 暴露业务动作，`registration` / `engine` 实现业务能力。Patio 不解释 RBG 生命周期阶段；RI label 是当前唯一的 hook 接入协议。
+
 ```mermaid
 flowchart TB
     C["RBG / 编排系统"] -->|写入 signalLabel 组合| R[("RoleInstance labels")]
-    F["event_callbacks 配置"] --> B["插件注册与绑定解析"]
-    B --> X["Executor：start / 有序 signalLabel / end"]
-    R -->|直接 LIST/WATCH| W["RI watcher / signalLabel client"]
-    W -->|最新 labels 快照| X
-    X -->|callback 成功后清除对应 signalLabel| W
-    W -->|GET / PATCH| R
+    F["event_callbacks 配置"] --> B["application：依赖装配、注册与绑定解析"]
+    B --> X["events/executor：start / 有序 hook / end"]
+    B -->|创建所需资源| W["events/hooks/roleinstance：RI hook adapter"]
+    R -->|直接 LIST/WATCH| W
+    W -->|最新快照、匹配与复核结果| X
+    X -->|callback 成功后请求 ack| W
+    W -->|GET / 条件 PATCH / 确认| R
     R -->|各 signalLabel 完成确认| C
-    X --> P["独立 Callback plugins"]
-    P --> T["共享业务依赖 / heartbeat"]
-    T --> A["registration / drain adapters"]
-    E["endpoint resolver"] --> A
-    A --> U["Router / Proxy / Engine"]
+    X -->|调用已绑定的 callable| P["callbacks：独立操作入口"]
+    P --> S["registration/service：注册业务协调"]
+    S --> H["registration/heartbeat：周期注册与在途收束"]
+    S --> A["registration adapters"]
+    H --> A
+    P --> E["engine：就绪与排空能力"]
+    S --> E
+    A --> U["Router / Proxy"]
+    E --> I["Engine"]
 ```
 
-start、hook 和 end 可以同时配置，全部转换为同一套执行结构。hook 的输入是 signal；当前实现只支持 signalLabel，后续可以扩展其他 signal 来源。没有 hook 绑定时不创建 Kubernetes watcher；没有注册相关 callback 时不启动 heartbeat 或修改 router 成员。插件可以共享业务依赖，但不共享 RBG hook 接口。
+start、hook 和 end 可以同时配置，复用 callback 调用机制，但保留各自的失败策略。没有 hook 绑定时不创建 Kubernetes client / watcher；没有注册相关 callback 时不创建注册服务、不启动 heartbeat，也不修改 router 成员。插件可以共享业务依赖，但不共享 RBG hook 接口。
+
+不设顶层 `lifecycle/`、统管业务的 `runtime/` 或 `events/handler/` 中间层。Executor 维护启动中、处理中、关闭中等执行状态；注册服务维护注册与 heartbeat 状态；RI hook adapter 维护观察快照和连接状态。它们不组成一个推断 RBG 生命周期的总状态机。
 
 ### 目录组织变化
 
-`api/`、`engine/`、`metrics/` 与本 proposal 无关，保持不变。
+保留 `api/`、`engine/`、`metrics/` 的现有职责。将 topo client 中的 engine health 检查归入 `engine/`，并补充就绪等待与排空状态能力；不重组现有 LoRA API 或指标暴露链路。
 
 当前结构：
 
@@ -181,51 +192,102 @@ patio/
     └── utils.py
 ```
 
-目标结构：
+目标结构（省略 `__init__.py`）：
 
 ```text
 patio/
-├── app.py
+├── app.py                      # CLI、进程入口
+├── application.py              # 依赖装配、任务管理、退出收束
+├── config.py
 ├── envs.py
-├── api/
-├── engine/
-├── metrics/
-├── lifecycle/              # RI 观察与 signalLabel 写回
-├── runtime/
-│   ├── callback_registry.py
-│   ├── executor.py
-│   ├── callbacks/          # 独立业务操作
-│   └── heartbeat/
+├── endpoints.py                # 地址解析，暂不扩成顶层目录
+├── events/
+│   ├── config.py               # 事件配置校验、兼容默认值
+│   ├── bindings.py             # 有序绑定及配置解析
+│   ├── registry.py             # callback 注册机制
+│   ├── executor.py             # start、hook、end 执行流程
+│   └── hooks/
+│       └── roleinstance.py     # RI 观察、匹配复核、条件清除与确认
+├── callbacks/
+│   ├── engine.py               # engine_wait_ready 等操作入口
+│   └── router.py               # onboard / offboard / cleanup 入口
 ├── registration/
-└── endpoint/
+│   ├── service.py              # 业务安全顺序、共享注册状态
+│   ├── heartbeat.py            # 周期注册启停、在途请求收束
+│   ├── base.py                 # 注册协议接口
+│   ├── factory.py
+│   ├── sglang.py               # SGLang router 协议
+│   └── vllm.py                 # vLLM proxy 协议
+├── engine/                     # health、排空状态、现有 LoRA 能力
+├── api/
+├── metrics/
+└── topo/                       # 保留 server 和迁移期必要兼容入口
 ```
 
 迁移关系：
 
 | 当前 | 目标 | 变化 |
 | --- | --- | --- |
-| `topo/client/*` | `registration/` | 只保留 SGLang / vLLM 成员注册协议 |
-| `topo/utils.py` 中的地址推导 | `endpoint/` | 独立推导 router / worker / engine endpoint |
-| `app.py` 中的 heartbeat loop | `runtime/heartbeat/` | 封装可 start / stop 的周期 register |
-| `app.py` 中的启动和信号编排 | `runtime/executor.py` | 统一执行配置中的 start、hook 和 end，不保留注册旁路 |
-| 新增 | `runtime/callback_registry.py`、`runtime/callbacks/` | 注册独立 callback，并在装配时共享所需依赖 |
-| 新增 | `lifecycle/` | 直接 watch RI，提供最新快照与 signalLabel 条件清理 |
-| `topo/server/` | 保持现状 | 与 Callback Executor 主线无关 |
+| `topo/client/*` 中的注册协议 | `registration/base.py`、`sglang.py`、`vllm.py` | 只保留 register / unregister / status 原语 |
+| `topo/factory.py` 中的 client 工厂 | `registration/factory.py` | 选择注册 adapter；server 工厂仍留在 topo |
+| topo clients 与 `topo/utils.py` 中的地址推导 | `endpoints.py` | 独立解析 router / worker / engine 地址 |
+| topo clients 中的 health 等待 | `engine/` | 区分引擎真正就绪与 HTTP 地址可达 |
+| `app.py` 与 topo 基类中的 heartbeat | `registration/heartbeat.py` | 统一为可启停、可收束的周期注册任务 |
+| `app.py` 中的启动和信号编排 | `application.py`、`events/executor.py` | 分离资源管理与操作调度，删除直接注册 / 注销旁路 |
+| 新增 | `events/registry.py`、`events/config.py`、`events/bindings.py`、`callbacks/` | 注册、校验、绑定独立操作 |
+| 新增 | `registration/service.py` | 协调 adapter、heartbeat 与 engine 能力，保证操作内部安全顺序 |
+| 新增 | `events/hooks/roleinstance.py` | 提供 RI 快照、匹配复核与完成确认 |
+| `topo/server/` | 保持现状 | 不随 client 整体迁移，与本次主线无关 |
 
 ### 模块边界
 
 | 模块 | 职责 | 不负责 |
 | --- | --- | --- |
-| `lifecycle` | 观察指定 RI、读取 labels、清理指定 signalLabel | RBG hook 识别、业务操作、finalizer、选举 |
-| `runtime/executor` | start / end 调度、按配置顺序匹配 signalLabel、串行执行和重试 | RBG hook 分类、router 协议 |
-| `runtime/callbacks` | 上线、摘流排空、路由清理等独立操作及其内部安全顺序 | 观察 RI、清除 signalLabel、决定绑定位置 |
-| `registration` | SGLang / vLLM register / unregister 协议 | 决定何时调用 |
-| `endpoint` | 推导 router / worker / engine 地址 | 注册协议 |
-| `heartbeat` | 周期性 register 的启停封装 | 生命周期决策 |
+| `application.py` | 按配置装配资源与 callback，协调 HTTP 服务、后台任务和退出 | 直接执行注册业务、解释 RI 生命周期 |
+| `events/config.py`、`bindings.py`、`registry.py` | 配置校验、名称注册与有序绑定；label 语法规则由 RI hook 模块提供 | 创建业务 client、执行 callback |
+| `events/executor.py` | 顺序扫描、串行调用、失败重试、退出期限、决定 ack 时机 | Kubernetes GET / PATCH、router 协议、heartbeat 控制 |
+| `events/hooks/roleinstance.py` | RI LIST/WATCH、快照匹配、GET 复核、条件 PATCH 与确认 | 调用 callback、决定业务完成、finalizer、选举 |
+| `callbacks/` | 暴露命名异步操作，调用已绑定的业务服务或 engine 能力 | 信号观察与确认、决定操作绑定位置 |
+| `registration/service.py` | 上线 / 下线 / 清理的安全顺序，协调注册状态、heartbeat、排空 | 事件调度、RI 状态、Kubernetes 写回 |
+| `registration/heartbeat.py` | 周期 register 的启停与在途收束 | 决定何时上线或下线 |
+| `registration` adapters | SGLang / vLLM 注册、注销及成员状态确认 | heartbeat 调度、事件重试、排空决策 |
+| `engine/` | 引擎就绪检查、排空状态与框架差异 | 路由注册、signalLabel 确认 |
+| `endpoints.py` | 根据环境变量和实例配置解析地址 | 网络注册、事件调度 |
+
+`events/executor.py` 只调用已绑定的 callable 和 hook adapter，不导入具体 callback 模块或 Kubernetes SDK。`events/registry.py` 不反向导入业务插件；`application.py` 显式装配这些模块。`callbacks/` 独立于 `events/` 放置，使业务操作与触发协议分开；注册 / 引擎能力层不反向依赖事件层。
+
+### 信号观察与完成确认
+
+监听与确认属于同一个 hook 协议，放在同一 adapter 中，不另设通用后处理模块。Executor 决定何时确认，adapter 决定如何确认：
+
+```text
+hook adapter 提供当前快照
+  -> Executor 按配置顺序匹配
+  -> adapter 复核当前信号
+  -> Executor await callback()
+  -> adapter ack：条件清除并确认
+  -> Executor 处理下一条绑定
+```
+
+RI label 表示当前仍待处理的请求，而非每条 WATCH 通知都对应一次业务调用。watcher 更新最新快照并唤醒 Executor，不把每个通知排队成独立 callback 任务。失败重试也能唤醒处理循环。callback 成功是 ack 的前提，不能在 `finally` 中无条件确认；撤销或改值只要求重新扫描，不代表业务成功。不提供 exactly-once 保证。
+
+| 入口 | 失败策略 | 完成确认 |
+| --- | --- | --- |
+| start | 停止后续 start / hook，进入限时清理 | 无 |
+| hook | 保留未完成信号，停止本轮并退避重试 | callback 成功后由 adapter 执行 |
+| end | 共用退出期限，best-effort 执行 | 无 |
+
+### 应用装配与资源所有权
+
+1. `application.py` 加载配置、显式导入受信任插件、创建应用级 callback 注册表，并在首次调用前完成依赖校验与绑定。只要求所选操作需要的资源；例如仅配置 `router_cleanup` 不要求 engine 排空能力。
+2. 同一应用中的 router callbacks 共享一个注册服务、adapter 和 heartbeat。进程级注册表只保存无状态插件定义；绑定 client 的 callable 属于当前应用，不放入跨应用共享的全局表。
+3. 应用层与 Uvicorn 使用一个关闭协调入口，在任何 start callback 前建立信号处理。先收束 Executor 当前操作，再请求已创建的业务资源停止后台活动，然后由 Executor 执行 end，最后关闭资源；所有步骤共用同一关闭预算。Executor 不直接调用 heartbeat。
+4. 即使 end 为空也必须停止本地后台任务，但不能因此隐式注销。start 业务等待运行在受管理任务中，不阻塞 HTTP 服务启动；start 完成前不处理 hook。组装或启动失败也要清理已创建的资源。
+5. 事件路径使用可取消、带超时的异步 I/O 和退避等待，不能仅把现有同步 `requests` / `time.sleep` 包在 `async def` 中。迁移期若桥接同步调用，必须跟踪并等待在途调用收束；取消等待协程不代表底层请求已终止。
 
 ### Registration 语义
 
-Registration 只封装成员注册协议：
+`registration` 分为业务服务与协议 adapter。`service.py` 保证上线 / 下线操作的内部顺序并管理共享状态；adapter 只封装成员注册原语：
 
 ```text
 register
@@ -261,7 +323,7 @@ worker endpoint
 engine health endpoint
 ```
 
-Heartbeat 是周期性调用 register 的自愈机制，不是下线控制器：
+Heartbeat 位于 `registration/heartbeat.py`，由注册服务持有，是周期性调用 register 的自愈机制，不是事件调度器或下线控制器：
 
 1. `start()` 后周期性 register；
 2. `stop()` 后不再调度新的 register；
@@ -290,7 +352,7 @@ scope:   Namespaced
 
 读写对象都是 RI；不经过 RI label 下传到 Pod 再由 Downward API 文件读取，避免下传延迟导致旧 label 被重复观察。
 
-Executor 只读取已配置 signalLabel 的 key/value，不依赖 `rbg.workloads.x-k8s.io/role-instance-hook-state` 或 `rbg.workloads.x-k8s.io/role-instance-lifecycle-state`。这些 label 缺失、取值未知或发生变化，都不改变 callback 的匹配结果，也不触发任务抢占。
+RI hook adapter 只读取已配置 signalLabel 的 key/value 进行匹配，Executor 使用其快照与复核结果，不依赖 `rbg.workloads.x-k8s.io/role-instance-hook-state` 或 `rbg.workloads.x-k8s.io/role-instance-lifecycle-state`。这些 label 缺失、取值未知或发生变化，都不改变 callback 的匹配结果，也不触发任务抢占。
 
 ### 协作流程
 
@@ -395,10 +457,10 @@ RBG Role 的 `lifecycle.labelsHandler` 定义 hook 到 signalLabel 的映射；�
 
 ### 信号行为
 
-在任何 start callback 执行前安装 SIGTERM / SIGINT 处理。收到信号后：
+`application.py` 在任何 start callback 执行前建立与 Uvicorn 统一的 SIGTERM / SIGINT 关闭协调入口，不保留独立的 topo 注销 signal handler。收到信号后：
 
 1. 停止接收新的 hook 工作，终止重试等待，并协作取消 / 收束当前 callback；不让它与 end callback 并发执行。
-2. 停止本进程 heartbeat 并等待在途 register 收束，再按配置顺序执行 end callbacks。
+2. 应用层请求已创建的注册服务停止 heartbeat 并等待在途 register 收束，再让 Executor 按配置顺序执行 end callbacks；Executor 不感知 heartbeat 具体实现。
 3. end 共用一个退出期限，best-effort 执行；失败记录后可继续下一项，期限耗尽则退出。退出期限由进程关闭预算提供，必须小于 Pod 剩余 termination grace period，不为每项重新计时。
 4. 信号不会被解释成任何 RBG hook，也不会为中断的 signalLabel 调用清除 signalLabel；end callback 不拥有 signalLabel 写回权限。
 5. 最终关闭 watcher、clients 和所有本地后台任务；即使 end callback 启动了后台任务，也不能让它延长进程退出期限。
@@ -411,7 +473,7 @@ callback 必须支持取消和有界 I/O；若当前任务无法在退出期限�
 
 ### Callback plugin 注册
 
-公共注册模块 `runtime/callback_registry.py`：
+公共注册模块 `events/registry.py`；全局表只保存无状态 callback，带依赖的操作注册到应用级表：
 
 ```python
 from collections.abc import Awaitable, Callable
@@ -421,52 +483,56 @@ EventCallback = Callable[[], Awaitable[None]]
 callback_plugins: dict[str, EventCallback] = {}
 
 
-def register_callback(name: str) -> Callable[[EventCallback], EventCallback]:
+def register_callback(
+    name: str,
+    *,
+    registry: dict[str, EventCallback] | None = None,
+) -> Callable[[EventCallback], EventCallback]:
+    target = callback_plugins if registry is None else registry
+
     def decorator(callback: EventCallback) -> EventCallback:
-        if name in callback_plugins:
+        if name in target:
             raise ValueError(f"Callback plugin 重复注册：{name}")
-        callback_plugins[name] = callback
+        target[name] = callback
         return callback
 
     return decorator
 ```
 
-独立插件模块 `runtime/callbacks/router.py`，这里只声明签名和职责：
+独立插件模块 `callbacks/router.py` 在装配时注册绑定同一个注册服务的操作；安全步骤由服务实现，不需要全局 client：
 
 ```python
-from ..callback_registry import register_callback
+from patio.events.registry import register_callback
 
 
-@register_callback("router_onboard")
-async def router_onboard() -> None:
-    # 确认引擎就绪、注册路由、启动 heartbeat。
-    ...
+def register_callbacks(registry, registration):
+    @register_callback("router_onboard", registry=registry)
+    async def router_onboard() -> None:
+        await registration.onboard()
 
+    @register_callback("router_offboard", registry=registry)
+    async def router_offboard() -> None:
+        await registration.offboard()
 
-@register_callback("router_offboard")
-async def router_offboard() -> None:
-    # 停止 heartbeat、等待在途注册、注销并排空。
-    ...
-
-
-@register_callback("router_cleanup")
-async def router_cleanup() -> None:
-    # 停止 heartbeat、等待在途注册、注销；不等待 engine 排空。
-    ...
+    @register_callback("router_cleanup", registry=registry)
+    async def router_cleanup() -> None:
+        await registration.cleanup()
 ```
 
-装饰器只在模块导入时保存函数引用，不执行业务操作。应用启动时显式导入受信任的插件模块，再校验配置；只增加一个文件不会自动发现，也不允许 YAML 指定任意模块路径或使用 `eval`。公共注册模块不反向导入业务插件。
+`application.py` 先复制无状态注册表，再调用所需插件模块的装配函数。`callbacks/engine.py` 用相同方式绑定 engine 能力。每个注册名在应用级表中必须唯一；配置引用未装配的能力时拒绝启动。
 
-需要共享 router client、heartbeat、engine 等状态时，在装配阶段用 `register_callback(name)(bound_callback)` 注册已绑定依赖的 callable；这是装饰器注册的替代方式，同名不得重复注册。注册后 callable 仍是无参数异步操作，不要求实现按 RBG hook 区分的统一多事件 handler。首次执行前必须完成依赖装配。
+装饰器只保存函数引用，不执行业务操作：无状态插件可在模块导入时用 `@register_callback("插件名")` 登记；带依赖插件在装配函数内指定应用级 `registry`。应用启动时显式导入受信任模块，完成所选能力的装配和名称校验后再生成绑定；只增加文件不会自动发现，也不允许 YAML 指定任意模块路径或使用 `eval`。公共注册模块不反向导入业务插件。
+
+也可用 `register_callback(name, registry=app_callbacks)(bound_callback)` 注册绑定依赖后的 callable；同名不能再用装饰器重复注册。注册后 callable 仍是无参数异步操作，不要求实现按 RBG hook 区分的统一多事件 handler。不同应用实例使用不同注册表和业务对象，避免重复装配时名称冲突或误用其他实例的 client。
 
 ### 配置到执行结构
 
-以下输入已完成“用户配置”一节的结构、插件名和 signalLabel 校验：
+`events/bindings.py` 将配置转换成有序执行结构；以下输入已完成“用户配置”一节的结构、插件名和 signalLabel 校验，`callback_plugins` 参数是已装配的应用级注册表：
 
 ```python
 from dataclasses import dataclass
 
-from .callback_registry import EventCallback
+from .registry import EventCallback
 
 
 @dataclass(frozen=True)
@@ -506,14 +572,14 @@ YAML 字段名为 `signalLabel`；Python 内部字段使用 `signal_label`。
 flowchart TD
     A["启动、注册插件、校验配置"] --> B["按序执行 start callbacks"]
     B -->|成功| C{"有 hook 绑定？"}
-    B -->|失败| H["收束当前任务、停止 heartbeat"]
+    B -->|失败| H["application 协调：收束当前任务、停止后台注册"]
     C -->|否| W["等待退出"]
-    C -->|是| L["LIST/WATCH RI labels"]
+    C -->|是| L["hook adapter：LIST/WATCH RI labels"]
     L --> D["从配置首项扫描当前快照"]
     D --> E{"当前 signalLabel 匹配？"}
     E -->|否| N{"还有下一条绑定？"}
-    E -->|是| F["GET 复核，再 await callback"]
-    F -->|成功| G["清除自己的 signalLabel 并确认"]
+    E -->|是| F["adapter 复核，再由 Executor await callback"]
+    F -->|成功| G["hook adapter ack：条件清除并确认"]
     G -->|成功| N
     F -->|失败| R["停止本轮；退避后 GET 最新快照"]
     G -->|失败| R
@@ -526,25 +592,25 @@ flowchart TD
     N -->|否| L
     L -. SIGTERM / SIGINT .-> H
     W -. SIGTERM / SIGINT .-> H
-    H --> I["按序执行 end callbacks；限时退出"]
+    H --> I["Executor 按序执行 end callbacks"]
+    I --> Z["application 关闭资源；共用期限内退出"]
 ```
 
-图中信号入口适用于整个生命周期，包括 start 等待期间。HTTP API 可独立服务；start 完成前不执行 signalLabel callback。
+此图表示 application、Executor 与 hook adapter 的协作，不表示所有步骤都在 Executor 内实现。信号入口适用于整个进程运行期，包括 start 等待期间；无法在期限内收束当前任务时不并行执行 end。HTTP API 可独立服务；start 完成前不执行 signalLabel callback。
 
-单轮有序处理示意；`ri_client` 的确认方法遵循“signalLabel 删除”一节，已确认清理返回 `True`，发现撤销 / 改值需重新扫描时返回 `False`，调用失败抛出异常：
+单轮有序处理位于 `events/executor.py`。`hook` 是 RI hook adapter：`revalidate` 通过 GET 复核当前信号；`ack` 遵循“signalLabel 删除”一节，已确认清理返回 `True`，发现撤销 / 改值需重新扫描时返回 `False`，调用失败抛出异常。RI 快照及其匹配方法由 adapter 提供，Executor 不直接访问 Kubernetes：
 
 ```python
-async def process_snapshot(snapshot, hook_bindings, ri_client):
+async def process_snapshot(snapshot, hook_bindings, hook):
     for binding in hook_bindings:
         if not snapshot.matches(binding.signal_label):
             continue
 
-        latest = await ri_client.get()
-        if not latest.matches(binding.signal_label):
+        if not await hook.revalidate(binding.signal_label):
             return
 
         await binding.callback()
-        if not await ri_client.clear_and_confirm(binding.signal_label):
+        if not await hook.ack(binding.signal_label):
             return
 ```
 
@@ -564,15 +630,18 @@ async def process_snapshot(snapshot, hook_bindings, ri_client):
 
 | Callback | 必须保证的内部顺序 | 常见信号（非限制） |
 | --- | --- | --- |
+| `engine_wait_ready` | 等待引擎真正就绪，不执行注册 | start，或需要等待就绪的 signalLabel |
 | `router_onboard` | 确认 engine ready → register 成功 → 启动 heartbeat | start，或上线 signalLabel |
 | `router_offboard` | 停止 heartbeat → 等待在途 register 收束 → unregister / 确认不存在 → 等待稳定 idle | 下线 / 删除前 signalLabel，或 end |
 | `router_cleanup` | 停止 heartbeat → 等待在途 register 收束 → unregister / 确认不存在；不做 engine drain | 恢复前 signalLabel，或 end |
 
-必要的安全步骤不能交给用户拆分排序。例如 `router_offboard` 内部保证注销前停止 heartbeat；失败重试期间 heartbeat 保持停止。未知注销结果必须报错，不能作为成功返回。仅取消本地 register 协程不证明远端请求未生效，adapter 必须保证在途注册收束，再确认成员移除。
+router callbacks 是操作入口，表中的内部顺序由共享的 `registration/service.py` 实现；`engine_wait_ready` 直接调用 engine 能力。即使提供独立等待 callback，`router_onboard` 也必须自行保证就绪前置条件，不能假定它之前已执行 `engine_wait_ready`。
+
+必要的安全步骤不能交给用户拆分排序。例如 `router_offboard` 经注册服务保证注销前停止 heartbeat；失败重试期间 heartbeat 保持停止。未知注销结果必须报错，不能作为成功返回。注册服务协调 heartbeat 和 adapter，保证在途注册收束后再确认成员移除；仅取消本地 register 协程不证明远端请求未生效。
 
 `router_cleanup` 不依赖 engine 指标；engine 已死或 drain 为 `unknown` / `unsupported` 时，只要成员移除已确认即可成功。需要排空的 `router_offboard` 则继续 fail closed。
 
-这些 callback 不接收 signalLabel，不读取 RI 生命周期状态，不自行 PATCH。成功返回后由 Executor 清理 signalLabel；start / end 没有 signalLabel 完成确认。
+这些 callback 不接收 signalLabel，不读取 RI 生命周期状态，不自行 PATCH。成功返回后由 Executor 请求 hook adapter 确认并清理 signalLabel；start / end 没有 signalLabel 完成确认。
 
 ### 跨功能顺序：路由与 KVCache
 
@@ -603,7 +672,7 @@ event_callbacks:
 
 ### 排空快照
 
-runtime 只定义通用排空语义；各推理框架由 adapter 解释“什么是 active / queued / drained”。
+`engine/` 定义通用排空快照，由各框架 adapter 解释“什么是 active / queued / drained”；`registration/service.py` 消费快照并等待稳定 idle，Executor 不解释排空指标。
 
 ```text
 state: idle | draining | unknown | unsupported
@@ -696,6 +765,7 @@ vLLM 指标可以覆盖仍在生成的流式请求，但不能覆盖已生成完
 6. 需要 vLLM 排空时必须提供 running / waiting / swapped gauges，缺失返回 `unsupported`；此要求不适用于无排空的 `router_cleanup`。
 7. 先升级 Patio 和 router / proxy，再部署 signalLabel 绑定；回滚前停止新编排操作并处理所有未完成 signalLabel，不能直接改成启动上线配置或移除事件文件。
 8. 新增 plugin 不等于支持任意脚本或 HTTP 检查入口。新增指标和日志为附加能力，旧指标变更需另行提供迁移说明。
+9. 本次模块重组保留 `signalLabel` 配置字段、`LIFECYCLE_*` 参数和下文 `patio_lifecycle_*` 指标命名，不因移除顶层 lifecycle 模块而更改对外接口；这些名称不表示 Patio 管理 RBG 生命周期。
 
 ## 可观测性
 
@@ -736,7 +806,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 ## 性能与可扩展性
 
 1. 每个 Callback Executor 只 watch 一个指定 RoleInstance，并使用 field selector 或客户端过滤，避免全 namespace informer。
-2. 本地缓存只需要当前 RI 对象和内部 traffic state；resourceVersion 越界或 watch 重连时重新 LIST/GET，不维护历史对象。
+2. RI hook adapter 缓存当前 RI 对象，注册服务单独维护本地 traffic / heartbeat 状态；resourceVersion 越界或 watch 重连时重新 LIST/GET，不维护历史事件队列。
 3. heartbeat 周期沿用 `HEARTBEAT_INTERVAL`；只有相关 callback 启动 heartbeat 才周期注册，signalLabel 监听本身不增加周期写。
 4. drain 轮询使用独立间隔和最小样本数，稳定窗口由 `LIFECYCLE_DRAIN_CHECK_INTERVAL` × `LIFECYCLE_DRAIN_STABLE_SAMPLES` 隐含确定；请求失败计入 backoff，不把失败样本当作 idle。
 5. 有 hook 绑定时每个进程增加一个 Kubernetes watch 连接；每轮按 O(N) 检测 N 条绑定。指标基数受已注册 callback / event / result / engine / source 组合约束。
@@ -788,7 +858,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 ### 单元测试
 
-1. 注册：导入只登记引用；重复名称拒绝；新模块需显式导入；绑定依赖与装饰器不能同名重复注册。
+1. 注册：导入不执行业务；无状态定义与应用级绑定分开；重复名称拒绝；新模块需显式导入；装配多个应用时注册表和 client 隔离，同一应用的 router callbacks 共享注册服务。
 2. 配置：未知字段 / plugin、错误类型、重复 YAML key、null 列表、非法 signalLabel、完全相同的 signalLabel 重复绑定拒绝，同 key 不同 value 允许；省略和空列表合法；空 label value 与 key 缺失区分。
 3. 默认值：无事件文件时按是否启用 topo client 生成默认绑定；显式空配置不注册；文件读取失败和旧草案 ENV 不静默回退；hook 非空要求 RI 名称。
 4. 映射：三类列表保留顺序，每条 `HookBinding` 只有一个 callback，无事件名或 handler 枚举。
@@ -799,6 +869,8 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 9. 业务 callback：onboard 自检 ready；offboard 停 heartbeat、等待在途 register、注销、排空；cleanup 不访问 engine drain；重试不重启 heartbeat。
 10. drain：SGLang running / queue、vLLM running / waiting / swapped 的全部适用 gauge 连续为零才 idle；缺失为 unsupported，网络 / 解析 / NaN 为 unknown；任何非 idle 重置计数。
 11. 信号：start 等待期间可退出；当前 callback 与 end 不并发；end 按序共用期限，失败 best-effort，不清理 hook signalLabel；无 end 时只收束本地资源。
+12. 模块边界：使用 fake callback / hook adapter 独立测试 Executor；确认 callback 失败不调用 ack，ack 失败不处理下一项；事件层不直接控制 heartbeat 或导入业务 client。
+13. 能力依赖：空 hook 不创建 Kubernetes client；仅 cleanup 不要求 engine drain；未选用的业务不要求相应依赖；独立 engine_wait_ready 不注册，onboard 不依赖此前已执行该 callback。
 
 ### 集成测试
 
@@ -807,6 +879,7 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 3. mock engine metrics 验证 offboard 完整顺序和部分失败保留 signalLabel。
 4. 用测试 callback 模拟路由 / KVCache：同次设置两个 signalLabel，验证逐项确认与失败阻塞，不要求实现 KVCache。
 5. 验证缺省绑定兼容、显式空 start 不注册、空 hook 不访问 Kubernetes，以及信号 end 配置生效。
+6. 与 Uvicorn 联合验证统一关闭入口：start 等待不阻塞 HTTP 服务，启动失败清理部分资源，关闭时先收束当前操作和后台注册再执行 end；空 end 不隐式注销，所有资源受同一退出预算约束。
 
 ### 端到端测试
 
@@ -832,12 +905,13 @@ Patio 的 HTTP health / readiness 不因 hook 处理中而自动失败。Patio R
 
 ## 上线计划
 
-1. 完成模块拆分、插件注册和默认绑定，替换旧启动 / 信号旁路，执行兼容性回归。
-2. 实现事件文件、有序 Executor、RI watcher 与条件清理，补充 RBAC、能力矩阵、日志和指标。
-3. 编排系统注入明确的 start / signalLabel / end 配置，小范围验证现有 RBG hook 映射、多 signalLabel 顺序和 Executor 重启后的重新触发。
-4. 确认无遗留 signalLabel、顺序错误和误注册后扩大范围。
-5. 回滚前停止新操作并处理未完成 signalLabel；确认允许恢复启动注册后才替换配置或回滚版本，不把手动删除 signalLabel 当作成功。
-6. signalLabel 协议变化时显式迁移；RBG 仅调整 hook 名称或 hook 到 signalLabel 的映射而 signalLabel 协议不变时，无需修改 Executor 分发。
+1. 先拆业务能力：提取 registration adapters、heartbeat、注册服务和 `endpoints.py`，将 health / 排空能力归入 `engine/`；保留 topo server 与必要兼容入口。
+2. 建立 `application.py`、`events/` 和独立 `callbacks/`，实现应用级依赖绑定、事件文件和兼容默认值；删除旧启动注册 / 信号注销旁路，验证异步 I/O 与统一退出收束。
+3. 接入 `events/hooks/roleinstance.py` 的观察、复核与 ack，不改变 callback 接口；补充 RBAC、能力矩阵、日志、指标及顺序 / 重试测试。
+4. 编排系统注入明确的 start / signalLabel / end 配置，小范围验证现有 RBG hook 映射、多 signalLabel 顺序和 Executor 重启后的重新触发。
+5. 确认无遗留 signalLabel、顺序错误和误注册后扩大范围。
+6. 回滚前停止新操作并处理未完成 signalLabel；确认允许恢复启动注册后才替换配置或回滚版本，不把手动删除 signalLabel 当作成功。
+7. signalLabel 协议变化时显式迁移；RBG 仅调整 hook 名称或 hook 到 signalLabel 的映射而 signalLabel 协议不变时，无需修改 Executor 分发。
 
 ## 开放问题
 
